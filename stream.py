@@ -3,164 +3,188 @@ import subprocess
 import sys
 import os
 import requests
-from textual import work
-from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Tree, Static, Label, ProgressBar
-from textual.containers import Horizontal, Vertical
-from term_image.image import from_file
+import time
+import base64
+from thefuzz import process
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 
+# --- CLOUD CONFIGURATION ---
 BUCKET_NAME = "audioplatformstack-audiostoragebucketd8d3b0dc-qfiv3hvchgq4"
 s3 = boto3.client('s3', region_name='ap-south-1')
 dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
+console = Console()
 
 def get_table():
     client = boto3.client('dynamodb', region_name='ap-south-1')
     for t in client.list_tables()['TableNames']:
         if 'AudioMetadataTable' in t: return dynamodb.Table(t)
-    return None
+    console.print("[red][-] Database not found![/red]")
+    sys.exit(1)
 
-class ArtDisplay(Static):
-    def update_art(self, local_path):
-        if not os.path.exists(local_path):
-            self.update("[dim]No Art Available[/dim]")
-            return
-        try:
-            img = from_file(local_path, width=45)
-            self.update(str(img))
-        except Exception as e:
-            self.update(f"[red]Render Error: {e}[/red]")
+table = get_table()
 
-class AudioPlatformTUI(App):
-    CSS = """
-    #left-pane { width: 40%; border-right: solid magenta; padding: 1; }
-    #right-pane { width: 60%; padding: 2; align: center top; }
-    ArtDisplay { height: 25; margin-bottom: 1; }
-    .title { text-style: bold; color: cyan; margin-bottom: 1; }
-    #now-playing-info { margin-bottom: 1; }
-    #track-progress { width: 100%; margin-top: 1; }
+def fetch_duration(audio_url):
+    """Uses ffprobe to grab the exact millisecond duration of the stream"""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_url]
+        return float(subprocess.check_output(cmd, text=True).strip())
+    except Exception:
+        return 0
+
+def render_ghostty_gpu(img_path):
     """
-    BINDINGS = [("q", "quit", "Quit Application")]
+    Forces Ghostty to render graphics by converting S3 images into 
+    pristine, chunked PNG payloads using the Kitty Protocol.
+    """
+    import base64
+    import io
+    from PIL import Image
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Horizontal():
-            with Vertical(id="left-pane"):
-                yield Label("🌐 GLOBAL CATALOG", classes="title")
-                yield Tree("Library", id="catalog-tree")
-            with Vertical(id="right-pane"):
-                yield ArtDisplay("Select a track to load S3 objects...", id="art-panel")
-                yield Label("▶ NOW PLAYING", classes="title")
-                yield Label("", id="now-playing-info")
-                yield ProgressBar(id="track-progress", show_eta=True) 
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self.table = get_table()
-        if not self.table: self.exit("Database not found")
-        self.load_catalog()
-        self.player_process = None
-        self.progress_timer = None
-        
-        bar = self.query_one("#track-progress", ProgressBar)
-        bar.progress = 0
-
-    def load_catalog(self):
-        tree = self.query_one("#catalog-tree", Tree)
-        items = self.table.scan().get('Items', [])
-        
-        catalog = {}
-        for item in items:
-            if item.get('Schema') != 'V4': continue
-            artist = item.get('Artist', 'Unknown')
-            release = item.get('ReleaseName', 'Unknown')
-            if artist not in catalog: catalog[artist] = {}
-            if release not in catalog[artist]: catalog[artist][release] = []
-            catalog[artist][release].append(item)
-
-        for artist, releases in catalog.items():
-            artist_node = tree.root.add(f"🎤 {artist}", expand=True)
-            for release, tracks in releases.items():
-                rel_node = artist_node.add(f"💿 {release}")
-                for t in sorted(tracks, key=lambda x: x.get('TrackNumber', '99')):
-                    rel_node.add_leaf(f"🎵 {t['TrackNumber']} - {t['TrackName']}", data=t)
-
-    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
-        if not event.node.allow_expand: 
-            self.play_track(event.node.data)
-
-    def play_track(self, data):
-        info_label = self.query_one("#now-playing-info", Label)
-        art_panel = self.query_one("#art-panel", ArtDisplay)
-        bar = self.query_one("#track-progress", ProgressBar)
-        
-        info_label.update(f"[bold white]{data['TrackName']}[/bold white]\n[cyan]{data['Artist']}[/cyan]\n[dim]Buffering...[/dim]")
-        
-        # Reset and pulse the bar only while fetching duration
-        if self.progress_timer: self.progress_timer.stop()
-        bar.progress = 0
-        bar.update(total=None)
-        
-        # 1. Fetch & Render Artwork (With Cache Healing)
-        cover_key = data.get('CoverKey')
-        if cover_key and cover_key != "NONE":
-            img_path = f"/tmp/{cover_key}"
+    try:
+        # 1. Intercept the JPEG and forcefully convert it to PNG in RAM
+        with Image.open(img_path) as img:
+            # Resize to a sane resolution so we don't crash the terminal with a 4K payload
+            img.thumbnail((400, 400)) 
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG")
+            png_data = buffer.getvalue()
             
-            # Delete the file if it's suspiciously small (broken XML cache)
-            if os.path.exists(img_path) and os.path.getsize(img_path) < 1000:
-                os.remove(img_path)
-                
-            if not os.path.exists(img_path):
-                url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET_NAME, 'Key': f"{data['TenantID']}/{cover_key}"})
+        b64 = base64.standard_b64encode(png_data).decode('ascii')
+        chunk_size = 4096
+        
+        sys.stdout.write("\n") # Breathing room top
+        
+        # 2. Blast the PNG binary chunks to Ghostty
+        for i in range(0, len(b64), chunk_size):
+            chunk = b64[i:i+chunk_size]
+            m = 1 if i + chunk_size < len(b64) else 0
+            
+            if i == 0:
+                # a=T (Transmit) | f=100 (PNG) | r=20 (Force 20 rows tall) | q=2 (Quiet mode)
+                sys.stdout.write(f"\033_Ga=T,f=100,r=20,q=2,m={m};{chunk}\033\\")
+            else:
+                sys.stdout.write(f"\033_Gm={m};{chunk}\033\\")
+        
+        # 3. Move the text cursor DOWN so the Rich panel doesn't overwrite the GPU image
+        sys.stdout.write("\n" * 21) 
+        sys.stdout.flush()
+        
+    except Exception as e:
+        console.print(f"[red]GPU Memory Error: {e}[/red]")
+
+def stream_audio(track_data):
+    os.system('clear' if os.name == 'posix' else 'cls')
+    
+    # 1. Image Download & Raw GPU Render
+    cover_key = track_data.get('CoverKey')
+    if cover_key and cover_key != "NONE":
+        img_path = f"/tmp/{cover_key}"
+        if os.path.exists(img_path) and os.path.getsize(img_path) < 1000:
+            os.remove(img_path) 
+            
+        if not os.path.exists(img_path):
+            with console.status("[bold cyan]Downloading High-Res Artwork from S3..."):
+                url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET_NAME, 'Key': f"{track_data['TenantID']}/{cover_key}"})
                 res = requests.get(url)
                 if res.status_code == 200:
                     with open(img_path, 'wb') as f: f.write(res.content)
-                    art_panel.update_art(img_path)
-                else:
-                    art_panel.update(f"[yellow]⚠️ S3 Error: Image dropped during ingestion.[/yellow]")
-            else:
-                art_panel.update_art(img_path)
-        else:
-            art_panel.update("[dim]No Cover Art Registered[/dim]")
-
-        # 2. Play Audio
-        if self.player_process: self.player_process.kill()
-        audio_url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET_NAME, 'Key': f"{data['TenantID']}/{data['FileName']}"})
-        self.player_process = subprocess.Popen(['mpv', '--no-video', '--msg-level=all=no', audio_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        info_label.update(f"[bold green]{data['TrackName']}[/bold green]\n[cyan]{data['Artist']}[/cyan]\n[dim]Streaming live from AWS Edge Node[/dim]")
+        if os.path.exists(img_path):
+            try:
+                # Fire the custom GPU protocol payload
+                render_ghostty_gpu(img_path)
+            except Exception as e:
+                console.print(f"[red]Raw GPU Render Error: {e}[/red]")
+    
+    # 2. Track Metadata Panel
+    console.print(Panel.fit(
+        f"[bold white]{track_data['TrackName']}[/bold white]\n"
+        f"[cyan]{track_data['Artist']}[/cyan] | [yellow]{track_data['ReleaseName']}[/yellow]\n"
+        f"[dim]Streaming live from AWS Edge Node[/dim]",
+        border_style="magenta"
+    ))
 
-        # 3. Fire the background thread to build the real progress bar
-        self.start_progress_tracker(audio_url)
+    # 3. Stream & Track Progress
+    audio_url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET_NAME, 'Key': f"{track_data['TenantID']}/{track_data['FileName']}"})
+    
+    with console.status("[bold green]Probing AWS stream for duration..."):
+        duration = fetch_duration(audio_url)
 
-    @work(thread=True)
-    def start_progress_tracker(self, audio_url):
-        """Runs in the background to probe the stream without freezing the UI"""
-        try:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_url]
-            duration = float(subprocess.check_output(cmd, text=True).strip())
-            # Safely tell the main UI thread to start the timer
-            self.call_from_thread(self.init_progress_bar, duration)
-        except Exception:
-            pass # Failsafe: leaves the bar in indeterminate pulsing mode
+    mpv_process = subprocess.Popen(['mpv', '--no-video', '--msg-level=all=no', audio_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def init_progress_bar(self, duration):
-        """Sets the exact track length and starts the 1-second tick"""
-        bar = self.query_one("#track-progress", ProgressBar)
-        bar.update(total=duration)
-        if self.progress_timer: self.progress_timer.stop()
-        self.progress_timer = self.set_interval(1.0, self.tick_progress)
-
-    def tick_progress(self):
-        """Advances the bar by 1 second if the audio player is still running"""
-        bar = self.query_one("#track-progress", ProgressBar)
-        if self.player_process and self.player_process.poll() is None:
-            bar.advance(1)
+    try:
+        if duration > 0:
+            with Progress(
+                TextColumn("[cyan]▶ NOW PLAYING"),
+                BarColumn(bar_width=40, style="magenta", complete_style="cyan"),
+                TimeElapsedColumn(),
+                TextColumn("/"),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task("Playing", total=duration)
+                while mpv_process.poll() is None:
+                    time.sleep(1)
+                    progress.advance(task, 1)
         else:
-            if self.progress_timer: self.progress_timer.stop()
+            console.print("[yellow]Playing (Live Stream - Unknown Duration)... Press Ctrl+C to stop.[/yellow]")
+            mpv_process.wait()
+            
+    except KeyboardInterrupt:
+        mpv_process.kill()
+        console.print("\n[yellow]Playback stopped.[/yellow]")
+        time.sleep(1)
 
-    def on_unmount(self) -> None:
-        if self.player_process: self.player_process.kill()
+def display_library():
+    with console.status("[bold yellow]Hydrating V4 Global Catalog from DynamoDB..."):
+        items = table.scan().get('Items', [])
+        
+    search_index = {}
+    for item in items:
+        if item.get('Schema') != 'V4': continue
+        track, artist, release = item.get('TrackName'), item.get('Artist'), item.get('ReleaseName')
+        search_index[f"{track} {artist} {release}"] = item
+
+    if not search_index:
+        console.print("[red]No V4 audio tracks found in the database.[/red]")
+        sys.exit(0)
+
+    while True:
+        os.system('clear' if os.name == 'posix' else 'cls')
+        console.print(Panel.fit("[bold magenta]🌐 GLOBAL MUSIC BROWSER[/bold magenta]"))
+        
+        query = Prompt.ask("\n[bold cyan]Search Artist, Album, or Track (or 'q' to quit)[/bold cyan]")
+        if query.lower() == 'q': sys.exit(0)
+            
+        results = process.extract(query, search_index.keys(), limit=10)
+        
+        ui_table = Table(title="Search Results", show_header=True, header_style="bold magenta")
+        ui_table.add_column("ID", style="dim", width=4)
+        ui_table.add_column("Track", style="bold white")
+        ui_table.add_column("Artist", style="cyan")
+        ui_table.add_column("Release", style="yellow")
+        ui_table.add_column("Match %", justify="right", style="green")
+
+        match_list = []
+        for idx, (match_string, score) in enumerate(results):
+            data = search_index[match_string]
+            match_list.append(data)
+            ui_table.add_row(str(idx + 1), data['TrackName'], data['Artist'], data['ReleaseName'], f"{score}%")
+
+        console.print(ui_table)
+        
+        choice = Prompt.ask("\n[bold cyan]Select Track ID to Stream[/bold cyan] (hit Enter to search again)", default="")
+        if not choice: continue
+            
+        try:
+            selected = match_list[int(choice) - 1]
+            stream_audio(selected)
+        except (ValueError, IndexError):
+            pass
 
 if __name__ == "__main__":
-    app = AudioPlatformTUI()
-    app.run()
+    display_library()
