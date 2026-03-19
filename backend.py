@@ -5,7 +5,7 @@ import sys
 # --- CONFIGURATION ---
 REGION = 'ap-south-1'
 # IMPORTANT: Copy your Cognito Client ID from client.py and paste it here:
-CLIENT_ID = "YOUR_COGNITO_CLIENT_ID_HERE" 
+CLIENT_ID = "1ate091qv7ibstkvo0il3lsbrv" 
 
 dynamodb = boto3.resource('dynamodb', region_name=REGION)
 cognito_client = boto3.client('cognito-idp', region_name=REGION)
