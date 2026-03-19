@@ -12,6 +12,8 @@ use ratatui::{
     Terminal,
 };
 use std::{error::Error, io};
+use serde::Deserialize;
+use std::process::Command;
 
 // Catppuccin Mauve Dark Palette mapped to RGB
 const MAUVE: Color = Color::Rgb(203, 166, 247);
@@ -26,6 +28,16 @@ enum AuthMode {
     ListenerSignup,
 }
 
+#[derive(Deserialize, Debug)]
+struct AuthResponse {
+    status: String,
+    message: Option<String>,
+    username: Option<String>,
+    artist_name: Option<String>,
+    role: Option<String>,
+    token: Option<String>,
+}
+
 #[derive(PartialEq)]
 enum InputMode {
     Username,
@@ -37,6 +49,7 @@ struct App {
     input_mode: InputMode,
     username: String,
     password: String,
+    system_message: String,
 }
 
 impl App {
@@ -46,6 +59,7 @@ impl App {
             input_mode: InputMode::Username,
             username: String::new(),
             password: String::new(),
+            system_message: String::from("[SYS] WAITING FOR CREDENTIALS..."),
         }
     }
 }
@@ -173,10 +187,19 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
             f.render_widget(password_p, ui_chunks[3]);
 
             // --- FOOTER ---
-            let footer = Paragraph::new(Span::styled(
-                "[TAB] Switch Mode   [UP/DOWN] Select Field   [ENTER] Execute   [ESC] Quit",
-                Style::default().fg(TEXT_MUTED),
-            )).alignment(Alignment::Center);
+            // --- SYSTEM MESSAGE ---
+            let sys_color = if app.system_message.starts_with("[ERR]") { Color::Red } else { TEXT_MUTED };
+            
+            // Render it in the footer chunk, or create a new chunk if you prefer.
+            // For now, let's just overwrite the footer chunk's first line so we don't have to rewrite the layout array
+            let footer = Paragraph::new(vec![
+                Line::from(Span::styled(&app.system_message, Style::default().fg(sys_color))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[TAB] Switch Mode   [UP/DOWN] Select Field   [ENTER] Execute   [ESC] Quit",
+                    Style::default().fg(TEXT_MUTED),
+                ))
+            ]).alignment(Alignment::Center);
             f.render_widget(footer, ui_chunks[4]);
 
         })?;
@@ -201,9 +224,40 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                         };
                     }
                     KeyCode::Enter => {
-                        // HERE is where we will eventually call Python to authenticate
-                        // For now, it just clears the screen and quits
-                        return Ok(()); 
+                        app.system_message = String::from("[SYS] AUTHENTICATING...");
+                        
+                        // Spawn the Python headless broker
+                        let output = Command::new("python")
+                            .arg("../backend.py")
+                            .arg("login")
+                            .arg(&app.username)
+                            .arg(&app.password)
+                            .output();
+
+                        match output {
+                            Ok(output) => {
+                                // Capture the stdout from Python
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                
+                                // Try to parse the JSON
+                                if let Ok(response) = serde_json::from_str::<AuthResponse>(&stdout) {
+                                    if response.status == "success" {
+                                        let role = response.role.unwrap_or_default();
+                                        let name = response.artist_name.unwrap_or_default();
+                                        app.system_message = format!("[SYS] ACCESS GRANTED: {} ({})", name, role);
+                                        
+                                        // TODO: Here is where we will route to the Main App UI next!
+                                    } else {
+                                        app.system_message = format!("[ERR] {}", response.message.unwrap_or("AUTH FAILED".to_string()).to_uppercase());
+                                    }
+                                } else {
+                                    app.system_message = String::from("[ERR] INVALID BROKER RESPONSE");
+                                }
+                            }
+                            Err(_) => {
+                                app.system_message = String::from("[ERR] FAILED TO EXECUTE DATA BROKER");
+                            }
+                        }
                     }
                     KeyCode::Backspace => {
                         match app.input_mode {
