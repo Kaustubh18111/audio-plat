@@ -5,41 +5,49 @@ use crossterm::{
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState},
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
     Terminal,
 };
-use serde::Deserialize;
-use std::{error::Error, io, process::Command};
+use std::{error::Error, io};
 
-// 1. We strictly type the JSON coming from Python
-#[derive(Deserialize, Clone, Debug)]
-struct Track {
-    id: String,
-    track: String,
-    artist: String,
-    release: String,
-    tenant: String,
-    file_key: String,
-    cover_key: String,
+// Catppuccin Mauve Dark Palette mapped to RGB
+const MAUVE: Color = Color::Rgb(203, 166, 247);
+const MAUVE_LIGHT: Color = Color::Rgb(226, 199, 255);
+const TEXT_MUTED: Color = Color::Rgb(205, 195, 209);
+const TEXT_ACTIVE: Color = Color::Rgb(227, 224, 247);
+
+#[derive(PartialEq)]
+enum AuthMode {
+    Login,
+    CreatorSignup,
+    ListenerSignup,
 }
 
-// 2. The function that secretly runs your Python backend
-fn fetch_catalog_from_python() -> Vec<Track> {
-    // We use your exact virtual environment so boto3 works
-    let python_bin = "/home/kaustubh/audio-platform/.venv/bin/python";
-    let script_path = "/home/kaustubh/audio-platform/backend.py";
+#[derive(PartialEq)]
+enum InputMode {
+    Username,
+    Password,
+}
 
-    let output = Command::new(python_bin)
-        .arg(script_path)
-        .arg("catalog")
-        .output()
-        .expect("Failed to execute Python backend");
+struct App {
+    mode: AuthMode,
+    input_mode: InputMode,
+    username: String,
+    password: String,
+}
 
-    // Catch the JSON and parse it into our strict Rust structs
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&json_str).unwrap_or_else(|_| vec![])
+impl App {
+    fn new() -> App {
+        App {
+            mode: AuthMode::Login,
+            input_mode: InputMode::Username,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
 }
 
 #[tokio::main]
@@ -50,16 +58,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Boot up sequence: Fetch the catalog before we draw the UI
-    let tracks = fetch_catalog_from_python();
-    
-    // Set up the selection state (so we can scroll up and down)
-    let mut list_state = ListState::default();
-    if !tracks.is_empty() {
-        list_state.select(Some(0)); // Highlight the first track
-    }
-
-    let res = run_app(&mut terminal, tracks, list_state).await;
+    let mut app = App::new();
+    let res = run_app(&mut terminal, &mut app).await;
 
     disable_raw_mode()?;
     execute!(
@@ -76,75 +76,145 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    tracks: Vec<Track>,
-    mut list_state: ListState,
-) -> io::Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
         terminal.draw(|f| {
-            let chunks = Layout::default()
+            // 1. We use a transparent background (Color::Reset) 
+            let size = f.size();
+            let block = Block::default().style(Style::default().bg(Color::Reset));
+            f.render_widget(block, size);
+
+            // 2. Centering the UI using intentional void space
+            let vertical_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(30), // Top Void
+                    Constraint::Length(15),     // UI Box
+                    Constraint::Percentage(30), // Bottom Void
+                ])
+                .split(size);
+
+            let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
-                .split(f.size());
+                .constraints([
+                    Constraint::Percentage(30),
+                    Constraint::Percentage(40), // Center column
+                    Constraint::Percentage(30),
+                ])
+                .split(vertical_chunks[1]);
 
-            // 3. Build the interactive list for the Left Pane
-            let items: Vec<ListItem> = tracks
-                .iter()
-                .map(|t| {
-                    ListItem::new(format!("🎵 {} - {}", t.artist, t.track))
-                })
-                .collect();
+            let center_area = horizontal_chunks[1];
 
-            let catalog_list = List::new(items)
-                .block(
-                    Block::default()
-                        .title(" 🌐 GLOBAL CATALOG ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Magenta)),
-                )
-                .highlight_style(
-                    Style::default()
-                        .bg(Color::Cyan)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol(">> ");
+            let ui_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2), // Header
+                    Constraint::Length(4), // Tabs
+                    Constraint::Length(3), // Username
+                    Constraint::Length(3), // Password
+                    Constraint::Length(2), // Footer
+                ])
+                .split(center_area);
 
-            f.render_stateful_widget(catalog_list, chunks[0], &mut list_state);
+            // --- HEADER ---
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled("TERMINAL_OS ", Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)),
+                Span::styled("// AUTHENTICATION", Style::default().fg(TEXT_MUTED)),
+            ])).alignment(Alignment::Center);
+            f.render_widget(header, ui_chunks[0]);
 
-            // Right Pane (Placeholder for now)
-            let right_pane = Block::default()
-                .title(" ▶ NOW PLAYING ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
-            f.render_widget(right_pane, chunks[1]);
+            // --- TABS (The Command Selection) ---
+            let tabs_text = vec![
+                Line::from(Span::styled(
+                    if app.mode == AuthMode::Login { "▶ [ LOGIN ]" } else { "  LOGIN" },
+                    Style::default().fg(if app.mode == AuthMode::Login { MAUVE_LIGHT } else { TEXT_MUTED }),
+                )),
+                Line::from(Span::styled(
+                    if app.mode == AuthMode::CreatorSignup { "▶ [ CREATOR SIGN UP ]" } else { "  CREATOR SIGN UP" },
+                    Style::default().fg(if app.mode == AuthMode::CreatorSignup { MAUVE_LIGHT } else { TEXT_MUTED }),
+                )),
+                Line::from(Span::styled(
+                    if app.mode == AuthMode::ListenerSignup { "▶ [ LISTENER SIGN UP ]" } else { "  LISTENER SIGN UP" },
+                    Style::default().fg(if app.mode == AuthMode::ListenerSignup { MAUVE_LIGHT } else { TEXT_MUTED }),
+                )),
+            ];
+            let tabs = Paragraph::new(tabs_text).alignment(Alignment::Center);
+            f.render_widget(tabs, ui_chunks[1]);
+
+            // --- INPUT FIELDS (Monolithic Typography) ---
+            
+            // Username Input
+            let user_prefix = if app.input_mode == InputMode::Username { ">> " } else { "   " };
+            let user_color = if app.input_mode == InputMode::Username { MAUVE } else { TEXT_MUTED };
+            
+            let username_p = Paragraph::new(vec![
+                Line::from(Span::styled("IDENTITY_ID", Style::default().fg(TEXT_MUTED))),
+                Line::from(vec![
+                    Span::styled(user_prefix, Style::default().fg(MAUVE_LIGHT).add_modifier(Modifier::BOLD)),
+                    Span::styled(&app.username, Style::default().fg(TEXT_ACTIVE)),
+                    if app.input_mode == InputMode::Username { Span::styled("█", Style::default().fg(MAUVE)) } else { Span::raw("") },
+                ]),
+            ]);
+            f.render_widget(username_p, ui_chunks[2]);
+
+            // Password Input (Masked)
+            let pass_prefix = if app.input_mode == InputMode::Password { ">> " } else { "   " };
+            let pass_color = if app.input_mode == InputMode::Password { MAUVE } else { TEXT_MUTED };
+            let masked_pass = "*".repeat(app.password.len());
+
+            let password_p = Paragraph::new(vec![
+                Line::from(Span::styled("ACCESS_KEY", Style::default().fg(TEXT_MUTED))),
+                Line::from(vec![
+                    Span::styled(pass_prefix, Style::default().fg(MAUVE_LIGHT).add_modifier(Modifier::BOLD)),
+                    Span::styled(masked_pass, Style::default().fg(TEXT_ACTIVE)),
+                    if app.input_mode == InputMode::Password { Span::styled("█", Style::default().fg(MAUVE)) } else { Span::raw("") },
+                ]),
+            ]);
+            f.render_widget(password_p, ui_chunks[3]);
+
+            // --- FOOTER ---
+            let footer = Paragraph::new(Span::styled(
+                "[TAB] Switch Mode   [UP/DOWN] Select Field   [ENTER] Execute   [ESC] Quit",
+                Style::default().fg(TEXT_MUTED),
+            )).alignment(Alignment::Center);
+            f.render_widget(footer, ui_chunks[4]);
+
         })?;
 
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Down => {
-                        if !tracks.is_empty() {
-                            let i = match list_state.selected() {
-                                Some(i) => {
-                                    if i >= tracks.len() - 1 { 0 } else { i + 1 }
-                                }
-                                None => 0,
-                            };
-                            list_state.select(Some(i));
+                    KeyCode::Esc => return Ok(()),
+                    KeyCode::Tab => {
+                        // Cycle through the Auth Modes
+                        app.mode = match app.mode {
+                            AuthMode::Login => AuthMode::CreatorSignup,
+                            AuthMode::CreatorSignup => AuthMode::ListenerSignup,
+                            AuthMode::ListenerSignup => AuthMode::Login,
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        // Switch between Username and Password fields
+                        app.input_mode = match app.input_mode {
+                            InputMode::Username => InputMode::Password,
+                            InputMode::Password => InputMode::Username,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        // HERE is where we will eventually call Python to authenticate
+                        // For now, it just clears the screen and quits
+                        return Ok(()); 
+                    }
+                    KeyCode::Backspace => {
+                        match app.input_mode {
+                            InputMode::Username => { app.username.pop(); }
+                            InputMode::Password => { app.password.pop(); }
                         }
                     }
-                    KeyCode::Up => {
-                        if !tracks.is_empty() {
-                            let i = match list_state.selected() {
-                                Some(i) => {
-                                    if i == 0 { tracks.len() - 1 } else { i - 1 }
-                                }
-                                None => 0,
-                            };
-                            list_state.select(Some(i));
+                    KeyCode::Char(c) => {
+                        match app.input_mode {
+                            InputMode::Username => { app.username.push(c); }
+                            InputMode::Password => { app.password.push(c); }
                         }
                     }
                     _ => {}

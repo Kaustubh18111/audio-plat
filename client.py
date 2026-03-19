@@ -66,7 +66,7 @@ def register_user(username, password, email):
         # 3. Save to DynamoDB as a Profile Record
         table.put_item(Item={
             'TenantID': username,
-            'FileName': 'PROFILE_DATA', # Unique Sort Key for the profile
+            'SongID': 'PROFILE_DATA', # Unique Sort Key for the profile
             'Schema': 'UserProfile',
             'ArtistName': artist_name,
             'Bio': bio
@@ -95,7 +95,7 @@ def login_user(username, password):
             tenant_id = username
         
         # 2. Fetch the Artist Profile from DynamoDB
-        profile_res = table.get_item(Key={'TenantID': username, 'FileName': 'PROFILE_DATA'})
+        profile_res = table.get_item(Key={'TenantID': username, 'SongID': 'PROFILE_DATA'})
         if 'Item' in profile_res:
             artist_name = profile_res['Item'].get('ArtistName', username)
             print(f"[+] Welcome back, {artist_name}")
