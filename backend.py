@@ -4,10 +4,12 @@ import sys
 
 # --- CONFIGURATION ---
 REGION = 'ap-south-1'
+BUCKET_NAME = "audioplatformstack-audiostoragebucketd8d3b0dc-qfiv3hvchgq4"
 # IMPORTANT: Copy your Cognito Client ID from client.py and paste it here:
 CLIENT_ID = "1ate091qv7ibstkvo0il3lsbrv" 
 
 dynamodb = boto3.resource('dynamodb', region_name=REGION)
+s3_client = boto3.client('s3', region_name=REGION)
 cognito_client = boto3.client('cognito-idp', region_name=REGION)
 
 def get_table():
@@ -76,6 +78,19 @@ def fetch_catalog():
             })
     print(json.dumps(catalog))
 
+def stream_url(tenant_id, file_key):
+    """Generate a 3600-second pre-signed S3 URL for the given track."""
+    try:
+        s3_key = f"{tenant_id}/{file_key}"
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': BUCKET_NAME, 'Key': s3_key},
+            ExpiresIn=3600
+        )
+        print(json.dumps({"status": "success", "url": url}))
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e)}))
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         command = sys.argv[1]
@@ -88,3 +103,9 @@ if __name__ == "__main__":
                 headless_login(sys.argv[2], sys.argv[3])
             else:
                 print(json.dumps({"status": "error", "message": "Missing credentials"}))
+
+        elif command == "stream":
+            if len(sys.argv) >= 4:
+                stream_url(sys.argv[2], sys.argv[3])
+            else:
+                print(json.dumps({"status": "error", "message": "Missing tenant_id and file_key"}))

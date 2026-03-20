@@ -13,6 +13,26 @@ use ratatui::{
 };
 use serde::Deserialize;
 use std::{error::Error, io, process::Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, watch};
+
+// --- BACKGROUND EVENT SYSTEM ---
+// Events sent from async tasks back to the UI thread via mpsc channel.
+enum BackgroundEvent {
+    Log(String),
+    StreamReady(String),   // Pre-signed URL
+    StreamError(String),
+    PlaybackProgress { elapsed: f64, duration: f64 },
+    PlaybackEnded,
+}
+
+#[derive(Deserialize)]
+struct StreamResponse {
+    status: String,
+    url: Option<String>,
+    message: Option<String>,
+}
 
 // --- CATPPUCCIN PALETTE (Strict Match to DESIGN.md) ---
 const MAUVE: Color = Color::Rgb(203, 166, 247);
@@ -62,14 +82,23 @@ struct App {
     selected_track: usize,
     active_user_name: String,
     
-    // --- NEW: DYNAMIC PLAYBACK STATE ---
-    active_playing_track: Option<usize>, // Tracks what is actually playing vs just hovered
+    // --- DYNAMIC PLAYBACK STATE ---
+    active_playing_track: Option<usize>,
     is_playing: bool,
-    system_logs: Vec<String>,            // Dynamic log queue
+    system_logs: Vec<String>,
+
+    // --- MPV DAEMON & ASYNC CHANNELS ---
+    mpv_child: Option<std::process::Child>,
+    playback_elapsed: f64,
+    playback_duration: f64,
+    bg_rx: mpsc::Receiver<BackgroundEvent>,
+    bg_tx: mpsc::Sender<BackgroundEvent>,
+    ipc_cancel: Option<watch::Sender<bool>>,
 }
 
 impl App {
     fn new() -> App {
+        let (bg_tx, bg_rx) = mpsc::channel::<BackgroundEvent>(32);
         App {
             state: AppState::Auth,
             auth_mode: AuthMode::Login,
@@ -81,14 +110,164 @@ impl App {
             selected_track: 0,
             active_user_name: String::new(),
             
-            // Initialize new state
             active_playing_track: None,
             is_playing: false,
             system_logs: vec![
                 String::from("[SYS] KERNEL BOOT..."),
                 String::from("[SYS] AWAITING AUTHENTICATION"),
             ],
+
+            mpv_child: None,
+            playback_elapsed: 0.0,
+            playback_duration: 0.0,
+            bg_rx,
+            bg_tx,
+            ipc_cancel: None,
         }
+    }
+
+    /// Kill any running mpv process gracefully.
+    fn kill_mpv(&mut self) {
+        // Cancel IPC poller first
+        if let Some(cancel) = self.ipc_cancel.take() {
+            let _ = cancel.send(true);
+        }
+        if let Some(ref mut child) = self.mpv_child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.mpv_child = None;
+        self.playback_elapsed = 0.0;
+        self.playback_duration = 0.0;
+    }
+
+    /// Spawn mpv headlessly with the given pre-signed URL.
+    fn spawn_mpv(&mut self, url: &str) {
+        self.kill_mpv();
+        match std::process::Command::new("mpv")
+            .arg("--no-video")
+            .arg("--msg-level=all=no")
+            .arg("--input-ipc-server=/tmp/termstream_mpv.sock")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.mpv_child = Some(child);
+                self.is_playing = true;
+                self.push_log("[SYS] MPV DAEMON ONLINE".to_string());
+            }
+            Err(e) => {
+                self.push_log(format!("[ERR] MPV SPAWN FAILED: {}", e));
+                self.is_playing = false;
+            }
+        }
+    }
+
+    /// Spawn the IPC poller task that reads playback progress from mpv.
+    fn start_ipc_poller(&mut self) {
+        // Cancel any previous poller
+        if let Some(cancel) = self.ipc_cancel.take() {
+            let _ = cancel.send(true);
+        }
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.ipc_cancel = Some(cancel_tx);
+        let tx = self.bg_tx.clone();
+
+        tokio::spawn(async move {
+            // Retry connection — mpv takes a moment to create the socket
+            let stream = {
+                let mut conn = None;
+                for _ in 0..20 {
+                    match UnixStream::connect("/tmp/termstream_mpv.sock").await {
+                        Ok(s) => { conn = Some(s); break; }
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                    }
+                }
+                conn
+            };
+
+            let stream = match stream {
+                Some(s) => s,
+                None => {
+                    let _ = tx.send(BackgroundEvent::Log("[ERR] IPC SOCKET TIMEOUT".to_string())).await;
+                    return;
+                }
+            };
+
+            let _ = tx.send(BackgroundEvent::Log("[SYS] IPC PIPE CONNECTED".to_string())).await;
+
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = BufReader::new(reader);
+            let mut cancel_rx = cancel_rx;
+
+            loop {
+                // Check cancellation
+                if *cancel_rx.borrow() {
+                    break;
+                }
+
+                // Request time-pos and duration
+                let cmd_time = "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n";
+                let cmd_dur  = "{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n";
+
+                if writer.write_all(cmd_time.as_bytes()).await.is_err() { break; }
+                if writer.write_all(cmd_dur.as_bytes()).await.is_err() { break; }
+
+                let mut elapsed: Option<f64> = None;
+                let mut duration: Option<f64> = None;
+
+                // Read responses (mpv may also send async events, so read until we have both)
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                while (elapsed.is_none() || duration.is_none()) && tokio::time::Instant::now() < deadline {
+                    let mut line = String::new();
+                    let read_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        buf_reader.read_line(&mut line),
+                    ).await;
+
+                    match read_result {
+                        Ok(Ok(0)) => {
+                            // EOF — mpv closed the socket
+                            let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
+                            return;
+                        }
+                        Ok(Ok(_)) => {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                                let req_id = val.get("request_id").and_then(|v| v.as_u64());
+                                let error = val.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                                if error == "success" {
+                                    if let Some(data) = val.get("data").and_then(|v| v.as_f64()) {
+                                        match req_id {
+                                            Some(1) => elapsed = Some(data),
+                                            Some(2) => duration = Some(data),
+                                            _ => {}
+                                        }
+                                    }
+                                } else if req_id == Some(1) {
+                                    // time-pos failed — track likely ended
+                                    let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
+                                    return;
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
+                if let (Some(e), Some(d)) = (elapsed, duration) {
+                    let _ = tx.send(BackgroundEvent::PlaybackProgress { elapsed: e, duration: d }).await;
+                }
+
+                // Poll every 500ms
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                    _ = cancel_rx.changed() => { break; }
+                }
+            }
+        });
     }
 
     // Helper to push logs and keep the queue clean (max 5 items)
@@ -136,8 +315,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::Result<()> {
     loop {
+        // --- POLL BACKGROUND EVENTS (non-blocking) ---
+        while let Ok(event) = app.bg_rx.try_recv() {
+            match event {
+                BackgroundEvent::Log(msg) => app.push_log(msg),
+                BackgroundEvent::StreamReady(url) => {
+                    app.push_log("[SYS] PRE-SIGNED URL ACQUIRED".to_string());
+                    app.spawn_mpv(&url);
+                    app.start_ipc_poller();
+                }
+                BackgroundEvent::StreamError(msg) => {
+                    app.push_log(format!("[ERR] {}", msg));
+                    app.is_playing = false;
+                }
+                BackgroundEvent::PlaybackProgress { elapsed, duration } => {
+                    app.playback_elapsed = elapsed;
+                    app.playback_duration = duration;
+                }
+                BackgroundEvent::PlaybackEnded => {
+                    app.is_playing = false;
+                    app.playback_elapsed = 0.0;
+                    app.playback_duration = 0.0;
+                    app.push_log("[SYS] TRACK ENDED".to_string());
+                }
+            }
+        }
+
         terminal.draw(|f| {
-            // Root transparent block
             f.render_widget(Block::default().style(Style::default().bg(Color::Reset)), f.size());
             match app.state {
                 AppState::Auth => draw_auth(f, app),
@@ -147,7 +351,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
 
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Esc { return Ok(()); }
+                if key.code == KeyCode::Esc {
+                    app.kill_mpv();
+                    return Ok(());
+                }
                 match app.state {
                     AppState::Auth => handle_auth_input(key.code, app),
                     AppState::Dashboard => handle_dashboard_input(key.code, app),
@@ -369,13 +576,13 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     let inspector_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  
-            Constraint::Length(16), 
-            Constraint::Length(4),  
-            Constraint::Length(2),  
-            Constraint::Length(3),  
-            Constraint::Min(0),     
-            Constraint::Length(5),  
+            Constraint::Length(2),   // [0] Status header
+            Constraint::Length(16),  // [1] Art box
+            Constraint::Length(4),   // [2] Track metadata
+            Constraint::Length(2),   // [3] Progress bar
+            Constraint::Length(3),   // [4] Controls
+            Constraint::Min(0),      // [5] spacer
+            Constraint::Length(5),   // [6] System logs
         ]).split(columns[2]);
 
     // Dynamic Header
@@ -395,6 +602,39 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
             Line::from(Span::styled(t.artist.to_uppercase(), Style::default().fg(MAUVE))),
         ]);
         f.render_widget(meta_large, inspector_layout[2]);
+
+        // Progress bar
+        let progress_area = inspector_layout[3];
+        if app.playback_duration > 0.0 {
+            let pct = (app.playback_elapsed / app.playback_duration).clamp(0.0, 1.0);
+            let bar_width = progress_area.width.saturating_sub(14) as usize; // reserve space for timestamps
+            let filled = (pct * bar_width as f64) as usize;
+            let empty = bar_width.saturating_sub(filled);
+
+            let elapsed_min = (app.playback_elapsed as u64) / 60;
+            let elapsed_sec = (app.playback_elapsed as u64) % 60;
+            let dur_min = (app.playback_duration as u64) / 60;
+            let dur_sec = (app.playback_duration as u64) % 60;
+
+            let bar_line = Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled("█".repeat(filled), Style::default().fg(MAUVE)),
+                Span::styled("░".repeat(empty), Style::default().fg(SURFACE_HIGH)),
+                Span::styled(
+                    format!(" {:02}:{:02}/{:02}:{:02}", elapsed_min, elapsed_sec, dur_min, dur_sec),
+                    Style::default().fg(TEXT_MUTED),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(bar_line), progress_area);
+        } else {
+            let bar_width = progress_area.width.saturating_sub(14) as usize;
+            let bar_line = Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled("░".repeat(bar_width), Style::default().fg(SURFACE_HIGH)),
+                Span::styled(" --:--/--:--", Style::default().fg(TEXT_MUTED)),
+            ]);
+            f.render_widget(Paragraph::new(bar_line), progress_area);
+        }
 
         // Controls
         let play_icon = if app.is_playing { "⏸" } else { "▶" };
@@ -438,19 +678,74 @@ fn handle_dashboard_input(key: KeyCode, app: &mut App) {
         KeyCode::Up =>    { if app.selected_track > 2 { app.selected_track -= 3; } }
         KeyCode::Down =>  { if app.selected_track + 3 < app.catalog.len() { app.selected_track += 3; } }
         
-        // --- NEW: DYNAMIC CONTROLS ---
+        // --- MPV DAEMON CONTROLS ---
         KeyCode::Enter => {
+            // Kill previous stream if any
+            app.kill_mpv();
+
             app.active_playing_track = Some(app.selected_track);
-            app.is_playing = true;
-            let track_name = &app.catalog[app.selected_track].track;
+            app.is_playing = false; // Will be set to true when mpv actually spawns
+
+            let track = &app.catalog[app.selected_track];
+            let track_name = track.track.clone();
+            let tenant = track.tenant.clone();
+            let file_key = track.file_key.clone();
+
             app.push_log(format!("[SYS] FETCHING PRE-SIGNED URL FOR: {}", track_name.to_uppercase()));
-            app.push_log(format!("[SYS] INITIALIZING MPV DAEMON..."));
+
+            // Fire async task to fetch the S3 URL from the Python broker
+            let tx = app.bg_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(BackgroundEvent::Log("[SYS] BROKER HANDSHAKE...".to_string())).await;
+
+                let output = tokio::process::Command::new("python")
+                    .arg("../backend.py")
+                    .arg("stream")
+                    .arg(&tenant)
+                    .arg(&file_key)
+                    .output()
+                    .await;
+
+                match output {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        match serde_json::from_str::<StreamResponse>(&stdout) {
+                            Ok(resp) if resp.status == "success" => {
+                                if let Some(url) = resp.url {
+                                    let _ = tx.send(BackgroundEvent::StreamReady(url)).await;
+                                } else {
+                                    let _ = tx.send(BackgroundEvent::StreamError("NO URL IN RESPONSE".to_string())).await;
+                                }
+                            }
+                            Ok(resp) => {
+                                let msg = resp.message.unwrap_or("BROKER RETURNED ERROR".to_string());
+                                let _ = tx.send(BackgroundEvent::StreamError(msg.to_uppercase())).await;
+                            }
+                            Err(_) => {
+                                let _ = tx.send(BackgroundEvent::StreamError("INVALID JSON FROM BROKER".to_string())).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BackgroundEvent::StreamError(format!("BROKER EXEC FAILED: {}", e))).await;
+                    }
+                }
+            });
         }
         KeyCode::Char(' ') => {
-            if app.active_playing_track.is_some() {
-                app.is_playing = !app.is_playing;
-                let status = if app.is_playing { "RESUMED" } else { "PAUSED" };
-                app.push_log(format!("[SYS] STREAM {}", status));
+            if let Some(ref child) = app.mpv_child {
+                let pid = child.id();
+                if app.is_playing {
+                    // Send SIGSTOP to pause mpv
+                    unsafe { libc::kill(pid as i32, libc::SIGSTOP); }
+                    app.is_playing = false;
+                    app.push_log("[SYS] STREAM PAUSED".to_string());
+                } else {
+                    // Send SIGCONT to resume mpv
+                    unsafe { libc::kill(pid as i32, libc::SIGCONT); }
+                    app.is_playing = true;
+                    app.push_log("[SYS] STREAM RESUMED".to_string());
+                }
             }
         }
         _ => {}
