@@ -12,10 +12,11 @@ use ratatui::{
     Terminal,
 };
 use serde::Deserialize;
-use std::{error::Error, io, process::Command};
+use std::{error::Error, io, io::Write, process::Command};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
+use base64::Engine;
 
 // --- BACKGROUND EVENT SYSTEM ---
 // Events sent from async tasks back to the UI thread via mpsc channel.
@@ -24,7 +25,9 @@ enum BackgroundEvent {
     StreamReady(String),   // Pre-signed URL
     StreamError(String),
     PlaybackProgress { elapsed: f64, duration: f64 },
+    PlaybackPaused(bool),  // true = paused, false = playing
     PlaybackEnded,
+    CoverArtReady(Vec<u8>), // Raw image bytes from S3
 }
 
 #[derive(Deserialize)]
@@ -94,6 +97,11 @@ struct App {
     bg_rx: mpsc::Receiver<BackgroundEvent>,
     bg_tx: mpsc::Sender<BackgroundEvent>,
     ipc_cancel: Option<watch::Sender<bool>>,
+
+    // --- COVER ART (Kitty Graphics) ---
+    cover_art_data: Option<Vec<u8>>,
+    /// Cached terminal rect of the inspector art box for Kitty rendering
+    inspector_art_rect: Option<Rect>,
 }
 
 impl App {
@@ -123,6 +131,9 @@ impl App {
             bg_rx,
             bg_tx,
             ipc_cancel: None,
+
+            cover_art_data: None,
+            inspector_art_rect: None,
         }
     }
 
@@ -144,6 +155,8 @@ impl App {
     /// Spawn mpv headlessly with the given pre-signed URL.
     fn spawn_mpv(&mut self, url: &str) {
         self.kill_mpv();
+        // Remove stale socket before spawning
+        let _ = std::fs::remove_file("/tmp/termstream_mpv.sock");
         match std::process::Command::new("mpv")
             .arg("--no-video")
             .arg("--msg-level=all=no")
@@ -165,9 +178,9 @@ impl App {
         }
     }
 
-    /// Spawn the IPC poller task that reads playback progress from mpv.
-    fn start_ipc_poller(&mut self) {
-        // Cancel any previous poller
+    /// Spawn the IPC observer task that listens for property-change events from mpv.
+    fn start_ipc_observer(&mut self) {
+        // Cancel any previous observer
         if let Some(cancel) = self.ipc_cancel.take() {
             let _ = cancel.send(true);
         }
@@ -180,10 +193,10 @@ impl App {
             // Retry connection — mpv takes a moment to create the socket
             let stream = {
                 let mut conn = None;
-                for _ in 0..20 {
+                for _ in 0..30 {
                     match UnixStream::connect("/tmp/termstream_mpv.sock").await {
                         Ok(s) => { conn = Some(s); break; }
-                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
                     }
                 }
                 conn
@@ -203,68 +216,88 @@ impl App {
             let mut buf_reader = BufReader::new(reader);
             let mut cancel_rx = cancel_rx;
 
-            loop {
-                // Check cancellation
-                if *cancel_rx.borrow() {
-                    break;
+            // --- REGISTER PROPERTY OBSERVERS ---
+            let observe_cmds = [
+                "{\"command\":[\"observe_property\",1,\"time-pos\"]}\n",
+                "{\"command\":[\"observe_property\",2,\"duration\"]}\n",
+                "{\"command\":[\"observe_property\",3,\"pause\"]}\n",
+            ];
+            for cmd in &observe_cmds {
+                if writer.write_all(cmd.as_bytes()).await.is_err() {
+                    let _ = tx.send(BackgroundEvent::Log("[ERR] IPC WRITE FAILED".to_string())).await;
+                    return;
                 }
+            }
+            let _ = tx.send(BackgroundEvent::Log("[SYS] PROPERTY OBSERVERS REGISTERED".to_string())).await;
 
-                // Request time-pos and duration
-                let cmd_time = "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":1}\n";
-                let cmd_dur  = "{\"command\":[\"get_property\",\"duration\"],\"request_id\":2}\n";
+            // Track the latest known values
+            let mut last_elapsed: f64 = 0.0;
+            let mut last_duration: f64 = 0.0;
 
-                if writer.write_all(cmd_time.as_bytes()).await.is_err() { break; }
-                if writer.write_all(cmd_dur.as_bytes()).await.is_err() { break; }
+            // --- LISTEN FOR EVENTS ---
+            loop {
+                let mut line = String::new();
 
-                let mut elapsed: Option<f64> = None;
-                let mut duration: Option<f64> = None;
-
-                // Read responses (mpv may also send async events, so read until we have both)
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-                while (elapsed.is_none() || duration.is_none()) && tokio::time::Instant::now() < deadline {
-                    let mut line = String::new();
-                    let read_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        buf_reader.read_line(&mut line),
-                    ).await;
-
-                    match read_result {
-                        Ok(Ok(0)) => {
-                            // EOF — mpv closed the socket
-                            let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
-                            return;
-                        }
-                        Ok(Ok(_)) => {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let req_id = val.get("request_id").and_then(|v| v.as_u64());
-                                let error = val.get("error").and_then(|v| v.as_str()).unwrap_or("");
-                                if error == "success" {
-                                    if let Some(data) = val.get("data").and_then(|v| v.as_f64()) {
-                                        match req_id {
-                                            Some(1) => elapsed = Some(data),
-                                            Some(2) => duration = Some(data),
+                tokio::select! {
+                    result = buf_reader.read_line(&mut line) => {
+                        match result {
+                            Ok(0) => {
+                                // EOF — mpv closed the socket
+                                let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
+                                return;
+                            }
+                            Ok(_) => {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                                    // Handle property-change events
+                                    if val.get("event").and_then(|v| v.as_str()) == Some("property-change") {
+                                        let id = val.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        match id {
+                                            1 => {
+                                                // time-pos
+                                                if let Some(data) = val.get("data").and_then(|v| v.as_f64()) {
+                                                    last_elapsed = data;
+                                                    let _ = tx.send(BackgroundEvent::PlaybackProgress {
+                                                        elapsed: last_elapsed,
+                                                        duration: last_duration,
+                                                    }).await;
+                                                }
+                                            }
+                                            2 => {
+                                                // duration
+                                                if let Some(data) = val.get("data").and_then(|v| v.as_f64()) {
+                                                    last_duration = data;
+                                                    // Re-dispatch with updated duration
+                                                    let _ = tx.send(BackgroundEvent::PlaybackProgress {
+                                                        elapsed: last_elapsed,
+                                                        duration: last_duration,
+                                                    }).await;
+                                                }
+                                            }
+                                            3 => {
+                                                // pause state
+                                                if let Some(paused) = val.get("data").and_then(|v| v.as_bool()) {
+                                                    let _ = tx.send(BackgroundEvent::PlaybackPaused(paused)).await;
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
-                                } else if req_id == Some(1) {
-                                    // time-pos failed — track likely ended
-                                    let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
-                                    return;
+                                    // Handle end-file event
+                                    else if val.get("event").and_then(|v| v.as_str()) == Some("end-file") {
+                                        let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
+                                        return;
+                                    }
                                 }
                             }
+                            Err(_) => {
+                                let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
+                                return;
+                            }
                         }
-                        _ => break,
                     }
-                }
-
-                if let (Some(e), Some(d)) = (elapsed, duration) {
-                    let _ = tx.send(BackgroundEvent::PlaybackProgress { elapsed: e, duration: d }).await;
-                }
-
-                // Poll every 500ms
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
-                    _ = cancel_rx.changed() => { break; }
+                    _ = cancel_rx.changed() => {
+                        break;
+                    }
                 }
             }
         });
@@ -295,6 +328,45 @@ impl App {
     }
 }
 
+// --- KITTY GRAPHICS PROTOCOL ---
+/// Render image bytes directly to the terminal using the Kitty Graphics Protocol.
+/// `col` and `row` are the 1-based terminal cell coordinates for placement.
+/// `cols` and `rows` constrain the image to that many cells.
+fn render_kitty_image(image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+    let chunk_size = 4096;
+    let mut stdout = io::stdout();
+
+    // Move cursor to the target cell position
+    let _ = write!(stdout, "\x1b[{};{}H", row, col);
+
+    for (i, chunk) in b64.as_bytes().chunks(chunk_size).enumerate() {
+        let chunk_str = std::str::from_utf8(chunk).unwrap_or("");
+        let more = if (i + 1) * chunk_size < b64.len() { 1 } else { 0 };
+
+        if i == 0 {
+            // a=T (Transmit+Display), f=100 (PNG), c=columns, r=rows, q=2 (quiet)
+            let _ = write!(
+                stdout,
+                "\x1b_Ga=T,f=100,c={},r={},q=2,m={};{}\x1b\\",
+                cols, rows, more, chunk_str
+            );
+        } else {
+            let _ = write!(stdout, "\x1b_Gm={};{}\x1b\\", more, chunk_str);
+        }
+    }
+
+    let _ = stdout.flush();
+}
+
+/// Clear all Kitty graphics from the terminal.
+fn clear_kitty_images() {
+    let mut stdout = io::stdout();
+    // a=d, d=a — delete all images
+    let _ = write!(stdout, "\x1b_Ga=d,d=a\x1b\\");
+    let _ = stdout.flush();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
@@ -305,6 +377,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut app = App::new();
     let res = run_app(&mut terminal, &mut app).await;
+
+    // Clean up Kitty images before leaving
+    clear_kitty_images();
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
@@ -322,7 +397,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                 BackgroundEvent::StreamReady(url) => {
                     app.push_log("[SYS] PRE-SIGNED URL ACQUIRED".to_string());
                     app.spawn_mpv(&url);
-                    app.start_ipc_poller();
+                    app.start_ipc_observer();
                 }
                 BackgroundEvent::StreamError(msg) => {
                     app.push_log(format!("[ERR] {}", msg));
@@ -332,11 +407,23 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                     app.playback_elapsed = elapsed;
                     app.playback_duration = duration;
                 }
+                BackgroundEvent::PlaybackPaused(paused) => {
+                    app.is_playing = !paused;
+                    if paused {
+                        app.push_log("[SYS] STREAM PAUSED".to_string());
+                    } else {
+                        app.push_log("[SYS] STREAM RESUMED".to_string());
+                    }
+                }
                 BackgroundEvent::PlaybackEnded => {
                     app.is_playing = false;
                     app.playback_elapsed = 0.0;
                     app.playback_duration = 0.0;
                     app.push_log("[SYS] TRACK ENDED".to_string());
+                }
+                BackgroundEvent::CoverArtReady(data) => {
+                    app.push_log("[SYS] COVER ART LOADED".to_string());
+                    app.cover_art_data = Some(data);
                 }
             }
         }
@@ -349,10 +436,26 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
             }
         })?;
 
+        // --- RENDER KITTY GRAPHICS AFTER FRAME FLUSH ---
+        if app.state == AppState::Dashboard {
+            if let (Some(ref data), Some(rect)) = (&app.cover_art_data, app.inspector_art_rect) {
+                if rect.width > 0 && rect.height > 0 {
+                    render_kitty_image(
+                        data,
+                        rect.x + 1, // terminal coords are 1-based
+                        rect.y + 1,
+                        rect.width,
+                        rect.height,
+                    );
+                }
+            }
+        }
+
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Esc {
                     app.kill_mpv();
+                    clear_kitty_images();
                     return Ok(());
                 }
                 match app.state {
@@ -485,7 +588,7 @@ fn handle_auth_input(key: KeyCode, app: &mut App) {
 }
 
 // --- DASHBOARD RENDERER (THE SILENT COMMAND) ---
-fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
+fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
     let size = f.size();
     
     let main_layout = Layout::default()
@@ -590,8 +693,10 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     let status_color = if app.is_playing { MAUVE } else { TEXT_MUTED };
     f.render_widget(Paragraph::new(Span::styled(status_text, Style::default().fg(status_color))), inspector_layout[0]);
     
-    // Art Box
-    f.render_widget(Block::default().style(Style::default().bg(SURFACE_LOW)), inset(inspector_layout[1], 0, 1));
+    // Art Box — render the background block and store rect for Kitty rendering
+    let art_rect = inset(inspector_layout[1], 0, 1);
+    f.render_widget(Block::default().style(Style::default().bg(SURFACE_LOW)), art_rect);
+    app.inspector_art_rect = Some(art_rect);
 
     // Dynamic Metadata based on ACTIVE track (not just selected)
     let display_idx = app.active_playing_track.unwrap_or(app.selected_track);
@@ -626,6 +731,29 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
                 ),
             ]);
             f.render_widget(Paragraph::new(bar_line), progress_area);
+        } else if app.playback_elapsed > 0.0 {
+            // Duration unknown — show elapsed time counting up with pulsing bar
+            let bar_width = progress_area.width.saturating_sub(14) as usize;
+            let elapsed_min = (app.playback_elapsed as u64) / 60;
+            let elapsed_sec = (app.playback_elapsed as u64) % 60;
+
+            // Animate a pulse: a small block that moves across the bar
+            let pulse_pos = ((app.playback_elapsed as usize) * 2) % bar_width.max(1);
+            let mut bar_chars: Vec<Span> = Vec::new();
+            bar_chars.push(Span::styled(" ", Style::default()));
+            for i in 0..bar_width {
+                if i >= pulse_pos && i < pulse_pos + 3 {
+                    bar_chars.push(Span::styled("█", Style::default().fg(MAUVE)));
+                } else {
+                    bar_chars.push(Span::styled("░", Style::default().fg(SURFACE_HIGH)));
+                }
+            }
+            bar_chars.push(Span::styled(
+                format!(" {:02}:{:02}/??:??", elapsed_min, elapsed_sec),
+                Style::default().fg(TEXT_MUTED),
+            ));
+
+            f.render_widget(Paragraph::new(Line::from(bar_chars)), progress_area);
         } else {
             let bar_width = progress_area.width.saturating_sub(14) as usize;
             let bar_line = Line::from(vec![
@@ -682,6 +810,9 @@ fn handle_dashboard_input(key: KeyCode, app: &mut App) {
         KeyCode::Enter => {
             // Kill previous stream if any
             app.kill_mpv();
+            // Clear previous cover art
+            clear_kitty_images();
+            app.cover_art_data = None;
 
             app.active_playing_track = Some(app.selected_track);
             app.is_playing = false; // Will be set to true when mpv actually spawns
@@ -690,18 +821,22 @@ fn handle_dashboard_input(key: KeyCode, app: &mut App) {
             let track_name = track.track.clone();
             let tenant = track.tenant.clone();
             let file_key = track.file_key.clone();
+            let cover_key = track.cover_key.clone();
+            // Drop the immutable borrow on `track` before the mutable push_log call
+            drop(track);
 
             app.push_log(format!("[SYS] FETCHING PRE-SIGNED URL FOR: {}", track_name.to_uppercase()));
 
             // Fire async task to fetch the S3 URL from the Python broker
             let tx = app.bg_tx.clone();
+            let tenant_for_stream = tenant.clone();
             tokio::spawn(async move {
                 let _ = tx.send(BackgroundEvent::Log("[SYS] BROKER HANDSHAKE...".to_string())).await;
 
                 let output = tokio::process::Command::new("python")
                     .arg("../backend.py")
                     .arg("stream")
-                    .arg(&tenant)
+                    .arg(&tenant_for_stream)
                     .arg(&file_key)
                     .output()
                     .await;
@@ -731,21 +866,72 @@ fn handle_dashboard_input(key: KeyCode, app: &mut App) {
                     }
                 }
             });
+
+            // --- FETCH COVER ART (Kitty Graphics) ---
+            if cover_key != "NONE" && !cover_key.is_empty() {
+                let tx2 = app.bg_tx.clone();
+                let tenant2 = tenant.clone();
+                let cover_key2 = cover_key.clone();
+                tokio::spawn(async move {
+                    let _ = tx2.send(BackgroundEvent::Log("[SYS] FETCHING COVER ART...".to_string())).await;
+
+                    // Get presigned URL for cover image via backend broker
+                    let output = tokio::process::Command::new("python")
+                        .arg("../backend.py")
+                        .arg("stream")
+                        .arg(&tenant2)
+                        .arg(&cover_key2)
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            if let Ok(resp) = serde_json::from_str::<StreamResponse>(&stdout) {
+                                if resp.status == "success" {
+                                    if let Some(url) = resp.url {
+                                        // Download the image bytes
+                                        match reqwest::get(&url).await {
+                                            Ok(response) => {
+                                                match response.bytes().await {
+                                                    Ok(bytes) => {
+                                                        let _ = tx2.send(BackgroundEvent::CoverArtReady(bytes.to_vec())).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER DOWNLOAD FAILED: {}", e))).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER FETCH FAILED: {}", e))).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER BROKER FAILED: {}", e))).await;
+                        }
+                    }
+                });
+            }
         }
         KeyCode::Char(' ') => {
-            if let Some(ref child) = app.mpv_child {
-                let pid = child.id();
-                if app.is_playing {
-                    // Send SIGSTOP to pause mpv
-                    unsafe { libc::kill(pid as i32, libc::SIGSTOP); }
-                    app.is_playing = false;
-                    app.push_log("[SYS] STREAM PAUSED".to_string());
-                } else {
-                    // Send SIGCONT to resume mpv
-                    unsafe { libc::kill(pid as i32, libc::SIGCONT); }
-                    app.is_playing = true;
-                    app.push_log("[SYS] STREAM RESUMED".to_string());
-                }
+            // --- NATIVE MPV IPC PAUSE/RESUME ---
+            if app.mpv_child.is_some() {
+                let tx = app.bg_tx.clone();
+                tokio::spawn(async move {
+                    match UnixStream::connect("/tmp/termstream_mpv.sock").await {
+                        Ok(mut stream) => {
+                            let cmd = "{\"command\":[\"cycle\",\"pause\"]}\n";
+                            let _ = stream.write_all(cmd.as_bytes()).await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(BackgroundEvent::Log(format!("[ERR] PAUSE IPC FAILED: {}", e))).await;
+                        }
+                    }
+                });
             }
         }
         _ => {}

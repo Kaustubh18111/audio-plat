@@ -18,12 +18,11 @@ aws-sdk-cognitoidentityprovider = "1.18"
 
 # Terminal UI & Cross-platform backend
 
-# The Native Image Renderer (Locked to a known stable version for Ratatui 0.26)
-ratatui-image = { version = "0.4.0", features = ["crossterm"] }
-image = "0.24"
+# HTTP client for fetching cover art from S3
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64 = "0.22"
 
 # Utilities
 anyhow = "1.0"
 uuid = { version = "1.8", features = ["v4"] }
 fuzzy-matcher = "0.3"
-libc = "0.2"
