@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEvent, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -19,15 +19,14 @@ use tokio::sync::{mpsc, watch};
 use base64::Engine;
 
 // --- BACKGROUND EVENT SYSTEM ---
-// Events sent from async tasks back to the UI thread via mpsc channel.
 enum BackgroundEvent {
     Log(String),
-    StreamReady(String),   // Pre-signed URL
+    StreamReady(String),
     StreamError(String),
     PlaybackProgress { elapsed: f64, duration: f64 },
-    PlaybackPaused(bool),  // true = paused, false = playing
+    PlaybackPaused(bool),
     PlaybackEnded,
-    CoverArtReady(Vec<u8>), // Raw image bytes from S3
+    CoverArtReady(Vec<u8>),
 }
 
 #[derive(Deserialize)]
@@ -37,13 +36,13 @@ struct StreamResponse {
     message: Option<String>,
 }
 
-// --- CATPPUCCIN PALETTE (Strict Match to DESIGN.md) ---
+// --- CATPPUCCIN PALETTE ---
 const MAUVE: Color = Color::Rgb(203, 166, 247);
 const MAUVE_LIGHT: Color = Color::Rgb(226, 199, 255);
 const TEXT_ACTIVE: Color = Color::Rgb(205, 214, 244);
 const TEXT_MUTED: Color = Color::Rgb(166, 173, 200);
-const SURFACE_LOW: Color = Color::Rgb(30, 30, 46);   // Darker background elements
-const SURFACE_HIGH: Color = Color::Rgb(49, 50, 68);  // Active state backgrounds
+const SURFACE_LOW: Color = Color::Rgb(30, 30, 46);
+const SURFACE_HIGH: Color = Color::Rgb(49, 50, 68);
 
 // --- DATA STRUCTURES ---
 #[derive(Deserialize, Debug)]
@@ -51,14 +50,17 @@ struct AuthResponse {
     status: String,
     message: Option<String>,
     artist_name: Option<String>,
+    #[allow(dead_code)]
     role: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct Track {
+    #[allow(dead_code)]
     id: String,
     track: String,
     artist: String,
+    #[allow(dead_code)]
     release: String,
     tenant: String,
     file_key: String,
@@ -73,6 +75,10 @@ enum AuthMode { Login, CreatorSignup, ListenerSignup }
 #[derive(PartialEq)]
 enum InputMode { Username, Password }
 
+// --- SIDEBAR TAB STATE ---
+#[derive(PartialEq)]
+enum SidebarTab { Home, Search, Library }
+
 struct App {
     state: AppState,
     auth_mode: AuthMode,
@@ -80,11 +86,14 @@ struct App {
     username: String,
     password: String,
     system_message: String,
-    
+
     catalog: Vec<Track>,
     selected_track: usize,
     active_user_name: String,
-    
+
+    // --- SIDEBAR STATE ---
+    active_tab: SidebarTab,
+
     // --- DYNAMIC PLAYBACK STATE ---
     active_playing_track: Option<usize>,
     is_playing: bool,
@@ -100,8 +109,14 @@ struct App {
 
     // --- COVER ART (Kitty Graphics) ---
     cover_art_data: Option<Vec<u8>>,
-    /// Cached terminal rect of the inspector art box for Kitty rendering
+    /// Cached rect of the inspector art box for post-render Kitty injection.
     inspector_art_rect: Option<Rect>,
+    /// True once Kitty transmission has fired for the current cover art load.
+    kitty_rendered: bool,
+
+    // --- MOUSE HIT CACHE ---
+    /// Bounding boxes of each grid track cell, populated during draw.
+    grid_cell_rects: Vec<Rect>,
 }
 
 impl App {
@@ -117,7 +132,9 @@ impl App {
             catalog: Vec::new(),
             selected_track: 0,
             active_user_name: String::new(),
-            
+
+            active_tab: SidebarTab::Home,
+
             active_playing_track: None,
             is_playing: false,
             system_logs: vec![
@@ -134,12 +151,13 @@ impl App {
 
             cover_art_data: None,
             inspector_art_rect: None,
+            kitty_rendered: false,
+
+            grid_cell_rects: Vec::new(),
         }
     }
 
-    /// Kill any running mpv process gracefully.
     fn kill_mpv(&mut self) {
-        // Cancel IPC poller first
         if let Some(cancel) = self.ipc_cancel.take() {
             let _ = cancel.send(true);
         }
@@ -150,12 +168,11 @@ impl App {
         self.mpv_child = None;
         self.playback_elapsed = 0.0;
         self.playback_duration = 0.0;
+        self.kitty_rendered = false;
     }
 
-    /// Spawn mpv headlessly with the given pre-signed URL.
     fn spawn_mpv(&mut self, url: &str) {
         self.kill_mpv();
-        // Remove stale socket before spawning
         let _ = std::fs::remove_file("/tmp/termstream_mpv.sock");
         match std::process::Command::new("mpv")
             .arg("--no-video")
@@ -178,9 +195,7 @@ impl App {
         }
     }
 
-    /// Spawn the IPC observer task that listens for property-change events from mpv.
     fn start_ipc_observer(&mut self) {
-        // Cancel any previous observer
         if let Some(cancel) = self.ipc_cancel.take() {
             let _ = cancel.send(true);
         }
@@ -190,7 +205,6 @@ impl App {
         let tx = self.bg_tx.clone();
 
         tokio::spawn(async move {
-            // Retry connection — mpv takes a moment to create the socket
             let stream = {
                 let mut conn = None;
                 for _ in 0..30 {
@@ -216,7 +230,6 @@ impl App {
             let mut buf_reader = BufReader::new(reader);
             let mut cancel_rx = cancel_rx;
 
-            // --- REGISTER PROPERTY OBSERVERS ---
             let observe_cmds = [
                 "{\"command\":[\"observe_property\",1,\"time-pos\"]}\n",
                 "{\"command\":[\"observe_property\",2,\"duration\"]}\n",
@@ -230,11 +243,9 @@ impl App {
             }
             let _ = tx.send(BackgroundEvent::Log("[SYS] PROPERTY OBSERVERS REGISTERED".to_string())).await;
 
-            // Track the latest known values
             let mut last_elapsed: f64 = 0.0;
             let mut last_duration: f64 = 0.0;
 
-            // --- LISTEN FOR EVENTS ---
             loop {
                 let mut line = String::new();
 
@@ -242,18 +253,15 @@ impl App {
                     result = buf_reader.read_line(&mut line) => {
                         match result {
                             Ok(0) => {
-                                // EOF — mpv closed the socket
                                 let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
                                 return;
                             }
                             Ok(_) => {
                                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                                    // Handle property-change events
                                     if val.get("event").and_then(|v| v.as_str()) == Some("property-change") {
                                         let id = val.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
                                         match id {
                                             1 => {
-                                                // time-pos
                                                 if let Some(data) = val.get("data").and_then(|v| v.as_f64()) {
                                                     last_elapsed = data;
                                                     let _ = tx.send(BackgroundEvent::PlaybackProgress {
@@ -263,10 +271,8 @@ impl App {
                                                 }
                                             }
                                             2 => {
-                                                // duration
                                                 if let Some(data) = val.get("data").and_then(|v| v.as_f64()) {
                                                     last_duration = data;
-                                                    // Re-dispatch with updated duration
                                                     let _ = tx.send(BackgroundEvent::PlaybackProgress {
                                                         elapsed: last_elapsed,
                                                         duration: last_duration,
@@ -274,16 +280,13 @@ impl App {
                                                 }
                                             }
                                             3 => {
-                                                // pause state
                                                 if let Some(paused) = val.get("data").and_then(|v| v.as_bool()) {
                                                     let _ = tx.send(BackgroundEvent::PlaybackPaused(paused)).await;
                                                 }
                                             }
                                             _ => {}
                                         }
-                                    }
-                                    // Handle end-file event
-                                    else if val.get("event").and_then(|v| v.as_str()) == Some("end-file") {
+                                    } else if val.get("event").and_then(|v| v.as_str()) == Some("end-file") {
                                         let _ = tx.send(BackgroundEvent::PlaybackEnded).await;
                                         return;
                                     }
@@ -303,7 +306,6 @@ impl App {
         });
     }
 
-    // Helper to push logs and keep the queue clean (max 5 items)
     fn push_log(&mut self, msg: String) {
         self.system_logs.push(msg);
         if self.system_logs.len() > 5 {
@@ -329,15 +331,13 @@ impl App {
 }
 
 // --- KITTY GRAPHICS PROTOCOL ---
-/// Render image bytes directly to the terminal using the Kitty Graphics Protocol.
-/// `col` and `row` are the 1-based terminal cell coordinates for placement.
-/// `cols` and `rows` constrain the image to that many cells.
+/// Transmit image bytes to the terminal at `(col, row)` (1-based), constrained to `cols x rows` cells.
+/// Uses `s=auto,v=auto` for automatic scaling within the cell bounds.
 fn render_kitty_image(image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u16) {
     let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
     let chunk_size = 4096;
     let mut stdout = io::stdout();
 
-    // Move cursor to the target cell position
     let _ = write!(stdout, "\x1b[{};{}H", row, col);
 
     for (i, chunk) in b64.as_bytes().chunks(chunk_size).enumerate() {
@@ -345,10 +345,9 @@ fn render_kitty_image(image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u
         let more = if (i + 1) * chunk_size < b64.len() { 1 } else { 0 };
 
         if i == 0 {
-            // a=T (Transmit+Display), f=100 (PNG), c=columns, r=rows, q=2 (quiet)
             let _ = write!(
                 stdout,
-                "\x1b_Ga=T,f=100,c={},r={},q=2,m={};{}\x1b\\",
+                "\x1b_Ga=T,f=100,c={},r={},s=auto,v=auto,q=2,m={};{}\x1b\\",
                 cols, rows, more, chunk_str
             );
         } else {
@@ -359,10 +358,8 @@ fn render_kitty_image(image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u
     let _ = stdout.flush();
 }
 
-/// Clear all Kitty graphics from the terminal.
 fn clear_kitty_images() {
     let mut stdout = io::stdout();
-    // a=d, d=a — delete all images
     let _ = write!(stdout, "\x1b_Ga=d,d=a\x1b\\");
     let _ = stdout.flush();
 }
@@ -378,7 +375,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
     let res = run_app(&mut terminal, &mut app).await;
 
-    // Clean up Kitty images before leaving
     clear_kitty_images();
 
     disable_raw_mode()?;
@@ -424,6 +420,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                 BackgroundEvent::CoverArtReady(data) => {
                     app.push_log("[SYS] COVER ART LOADED".to_string());
                     app.cover_art_data = Some(data);
+                    // Reset so the new art gets rendered on next frame
+                    app.kitty_rendered = false;
                 }
             }
         }
@@ -436,32 +434,42 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
             }
         })?;
 
-        // --- RENDER KITTY GRAPHICS AFTER FRAME FLUSH ---
-        if app.state == AppState::Dashboard {
+        // --- POST-RENDER KITTY INJECTION ---
+        // Only fires once per new cover art load (guarded by kitty_rendered flag)
+        if app.state == AppState::Dashboard && !app.kitty_rendered {
             if let (Some(ref data), Some(rect)) = (&app.cover_art_data, app.inspector_art_rect) {
                 if rect.width > 0 && rect.height > 0 {
                     render_kitty_image(
                         data,
-                        rect.x + 1, // terminal coords are 1-based
+                        rect.x + 1, // convert from 0-based Ratatui to 1-based terminal
                         rect.y + 1,
                         rect.width,
                         rect.height,
                     );
+                    app.kitty_rendered = true;
                 }
             }
         }
 
         if event::poll(std::time::Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Esc {
-                    app.kill_mpv();
-                    clear_kitty_images();
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.code == KeyCode::Esc {
+                        app.kill_mpv();
+                        clear_kitty_images();
+                        return Ok(());
+                    }
+                    match app.state {
+                        AppState::Auth => handle_auth_input(key.code, app),
+                        AppState::Dashboard => handle_dashboard_input(key.code, app),
+                    }
                 }
-                match app.state {
-                    AppState::Auth => handle_auth_input(key.code, app),
-                    AppState::Dashboard => handle_dashboard_input(key.code, app),
+                Event::Mouse(mouse) => {
+                    if app.state == AppState::Dashboard {
+                        handle_mouse_input(mouse, app);
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -483,22 +491,20 @@ fn draw_auth(f: &mut ratatui::Frame, app: &App) {
     let ui_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Header
-            Constraint::Length(4), // Tabs
-            Constraint::Length(3), // User
-            Constraint::Length(3), // Pass
-            Constraint::Length(3), // Footer/Msg
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .split(horizontal_chunks[1]);
 
-    // Header
     let header = Paragraph::new(Line::from(vec![
         Span::styled("TERMINAL_OS ", Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)),
         Span::styled("// AUTH", Style::default().fg(TEXT_MUTED)),
     ])).alignment(Alignment::Center);
     f.render_widget(header, ui_chunks[0]);
 
-    // Tabs
     let tabs = Paragraph::new(vec![
         Line::from(Span::styled(if app.auth_mode == AuthMode::Login { "▶ [ LOGIN ]" } else { "  LOGIN" }, Style::default().fg(if app.auth_mode == AuthMode::Login { MAUVE_LIGHT } else { TEXT_MUTED }))),
         Line::from(Span::styled(if app.auth_mode == AuthMode::CreatorSignup { "▶ [ CREATOR ]" } else { "  CREATOR" }, Style::default().fg(if app.auth_mode == AuthMode::CreatorSignup { MAUVE_LIGHT } else { TEXT_MUTED }))),
@@ -506,24 +512,30 @@ fn draw_auth(f: &mut ratatui::Frame, app: &App) {
     ]).alignment(Alignment::Center);
     f.render_widget(tabs, ui_chunks[1]);
 
-    // Inputs
     let u_prefix = if app.input_mode == InputMode::Username { ">> " } else { "   " };
     let p_prefix = if app.input_mode == InputMode::Password { ">> " } else { "   " };
     let masked_pass = "*".repeat(app.password.len());
 
     let user_p = Paragraph::new(vec![
         Line::from(Span::styled("IDENTITY", Style::default().fg(TEXT_MUTED))),
-        Line::from(vec![Span::styled(u_prefix, Style::default().fg(MAUVE_LIGHT)), Span::styled(&app.username, Style::default().fg(TEXT_ACTIVE)), if app.input_mode == InputMode::Username { Span::styled("█", Style::default().fg(MAUVE)) } else { Span::raw("") }]),
+        Line::from(vec![
+            Span::styled(u_prefix, Style::default().fg(MAUVE_LIGHT)),
+            Span::styled(&app.username, Style::default().fg(TEXT_ACTIVE)),
+            if app.input_mode == InputMode::Username { Span::styled("█", Style::default().fg(MAUVE)) } else { Span::raw("") },
+        ]),
     ]);
     f.render_widget(user_p, ui_chunks[2]);
 
     let pass_p = Paragraph::new(vec![
         Line::from(Span::styled("ACCESS_KEY", Style::default().fg(TEXT_MUTED))),
-        Line::from(vec![Span::styled(p_prefix, Style::default().fg(MAUVE_LIGHT)), Span::styled(masked_pass, Style::default().fg(TEXT_ACTIVE)), if app.input_mode == InputMode::Password { Span::styled("█", Style::default().fg(MAUVE)) } else { Span::raw("") }]),
+        Line::from(vec![
+            Span::styled(p_prefix, Style::default().fg(MAUVE_LIGHT)),
+            Span::styled(masked_pass, Style::default().fg(TEXT_ACTIVE)),
+            if app.input_mode == InputMode::Password { Span::styled("█", Style::default().fg(MAUVE)) } else { Span::raw("") },
+        ]),
     ]);
     f.render_widget(pass_p, ui_chunks[3]);
 
-    // System Msg
     let sys_color = if app.system_message.starts_with("[ERR]") { Color::Red } else { TEXT_MUTED };
     let footer = Paragraph::new(vec![
         Line::from(Span::styled(&app.system_message, Style::default().fg(sys_color))),
@@ -542,7 +554,10 @@ fn handle_auth_input(key: KeyCode, app: &mut App) {
             };
         }
         KeyCode::Up | KeyCode::Down => {
-            app.input_mode = match app.input_mode { InputMode::Username => InputMode::Password, InputMode::Password => InputMode::Username };
+            app.input_mode = match app.input_mode {
+                InputMode::Username => InputMode::Password,
+                InputMode::Password => InputMode::Username,
+            };
         }
         KeyCode::Backspace => {
             match app.input_mode {
@@ -558,8 +573,6 @@ fn handle_auth_input(key: KeyCode, app: &mut App) {
         }
         KeyCode::Enter => {
             app.system_message = String::from("[SYS] AUTHENTICATING...");
-            
-            // HEADLESS BROKER EXECUTION
             let output = Command::new("python")
                 .arg("../backend.py")
                 .arg("login")
@@ -572,25 +585,26 @@ fn handle_auth_input(key: KeyCode, app: &mut App) {
                 if let Ok(response) = serde_json::from_str::<AuthResponse>(&stdout) {
                     if response.status == "success" {
                         app.active_user_name = response.artist_name.unwrap_or_default();
-                        
-                        // TRANSITION STATE!
                         app.state = AppState::Dashboard;
-                        app.fetch_catalog(); 
-                        
+                        app.fetch_catalog();
                     } else {
                         app.system_message = format!("[ERR] {}", response.message.unwrap_or("AUTH FAILED".to_string()).to_uppercase());
                     }
-                } else { app.system_message = String::from("[ERR] INVALID JSON RESPONSE"); }
-            } else { app.system_message = String::from("[ERR] BROKER FAILED"); }
+                } else {
+                    app.system_message = String::from("[ERR] INVALID JSON RESPONSE");
+                }
+            } else {
+                app.system_message = String::from("[ERR] BROKER FAILED");
+            }
         }
         _ => {}
     }
 }
 
-// --- DASHBOARD RENDERER (THE SILENT COMMAND) ---
+// --- DASHBOARD RENDERER ---
 fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
     let size = f.size();
-    
+
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(3)])
@@ -609,10 +623,10 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
     let sidebar_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  
-            Constraint::Length(12), 
-            Constraint::Min(0),     
-            Constraint::Length(3),  
+            Constraint::Length(4),
+            Constraint::Length(12),
+            Constraint::Min(0),
+            Constraint::Length(3),
         ]).split(columns[0]);
 
     let user_profile = Paragraph::new(vec![
@@ -621,57 +635,147 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
     ]);
     f.render_widget(user_profile, sidebar_layout[0]);
 
+    // Dynamic sidebar: only active tab gets SURFACE_HIGH bg + MAUVE_LIGHT fg
+    let home_style = if app.active_tab == SidebarTab::Home {
+        Style::default().fg(MAUVE_LIGHT).bg(SURFACE_HIGH)
+    } else {
+        Style::default().fg(TEXT_MUTED)
+    };
+    let search_style = if app.active_tab == SidebarTab::Search {
+        Style::default().fg(MAUVE_LIGHT).bg(SURFACE_HIGH)
+    } else {
+        Style::default().fg(TEXT_MUTED)
+    };
+    let library_style = if app.active_tab == SidebarTab::Library {
+        Style::default().fg(MAUVE_LIGHT).bg(SURFACE_HIGH)
+    } else {
+        Style::default().fg(TEXT_MUTED)
+    };
+
     let nav_links = Paragraph::new(vec![
         Line::from(""),
-        Line::from(Span::styled(" ⌂ HOME [H]", Style::default().fg(TEXT_ACTIVE).bg(SURFACE_HIGH))),
+        Line::from(Span::styled(" ⌂ HOME [H]", home_style)),
         Line::from(""),
-        Line::from(Span::styled(" Q SEARCH [S]", Style::default().fg(TEXT_MUTED))),
+        Line::from(Span::styled(" Q SEARCH [S]", search_style)),
         Line::from(""),
-        Line::from(Span::styled(" ≡ LIBRARY [L]", Style::default().fg(TEXT_MUTED))),
+        Line::from(Span::styled(" ≡ LIBRARY [L]", library_style)),
     ]);
     f.render_widget(nav_links, sidebar_layout[1]);
 
     let new_buffer_btn = Paragraph::new(Span::styled(
-        "    + NEW_BUFFER    ", 
+        "    + NEW_BUFFER    ",
         Style::default().fg(MAUVE).bg(SURFACE_LOW)
     )).alignment(Alignment::Center);
     f.render_widget(new_buffer_btn, sidebar_layout[3]);
 
-
-    // 2. MAIN GRID
+    // 2. MAIN GRID — conditional based on active_tab
     let grid_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(4), Constraint::Min(0)])
         .split(columns[1]);
 
-    let grid_header = Paragraph::new(vec![
-        Line::from(Span::styled("PROMPT: ./FETCH_TRENDING_DATA", Style::default().fg(TEXT_MUTED))),
-        Line::from(Span::styled("ACTIVE_ALBUMS", Style::default().fg(TEXT_ACTIVE).add_modifier(Modifier::BOLD))),
-    ]);
-    f.render_widget(grid_header, grid_layout[0]);
+    match app.active_tab {
+        SidebarTab::Home => {
+            let grid_header = Paragraph::new(vec![
+                Line::from(Span::styled("PROMPT: ./FETCH_TRENDING_DATA", Style::default().fg(TEXT_MUTED))),
+                Line::from(Span::styled("ACTIVE_ALBUMS", Style::default().fg(TEXT_ACTIVE).add_modifier(Modifier::BOLD))),
+            ]);
+            f.render_widget(grid_header, grid_layout[0]);
 
-    let rows = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(grid_layout[1]);
-    for r in 0..2 {
-        let cols = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(33)]).split(rows[r]);
-        for c in 0..3 {
-            let idx = (r * 3) + c;
-            if idx < app.catalog.len() {
-                let track = &app.catalog[idx];
-                let is_selected = app.selected_track == idx;
-                
-                let title_style = if is_selected { Style::default().fg(MAUVE).add_modifier(Modifier::BOLD) } else { Style::default().fg(TEXT_ACTIVE).add_modifier(Modifier::BOLD) };
-                
-                let item_layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(12), Constraint::Length(3)]).split(cols[c]);
-                
-                let art_box = Block::default().style(Style::default().bg(SURFACE_LOW));
-                f.render_widget(art_box, inset(item_layout[0], 1, 1)); 
+            // Clear the cached rects before re-populating
+            app.grid_cell_rects.clear();
 
-                let meta = Paragraph::new(vec![
-                    Line::from(Span::styled(track.track.to_uppercase(), title_style)),
-                    Line::from(Span::styled(track.artist.to_uppercase(), Style::default().fg(TEXT_MUTED))),
-                ]);
-                f.render_widget(meta, inset(item_layout[1], 1, 0));
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(grid_layout[1]);
+
+            for r in 0..2 {
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(33)])
+                    .split(rows[r]);
+                for c in 0..3 {
+                    let idx = (r * 3) + c;
+                    // Always push the cell rect (even for empty slots) so index alignment is preserved
+                    app.grid_cell_rects.push(cols[c]);
+
+                    if idx < app.catalog.len() {
+                        let track = &app.catalog[idx];
+                        let is_selected = app.selected_track == idx;
+
+                        let title_style = if is_selected {
+                            Style::default().fg(MAUVE).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(TEXT_ACTIVE).add_modifier(Modifier::BOLD)
+                        };
+
+                        let item_layout = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Length(12), Constraint::Length(3)])
+                            .split(cols[c]);
+
+                        let art_box = Block::default().style(Style::default().bg(SURFACE_LOW));
+                        f.render_widget(art_box, inset(item_layout[0], 1, 1));
+
+                        let meta = Paragraph::new(vec![
+                            Line::from(Span::styled(track.track.to_uppercase(), title_style)),
+                            Line::from(Span::styled(track.artist.to_uppercase(), Style::default().fg(TEXT_MUTED))),
+                        ]);
+                        f.render_widget(meta, inset(item_layout[1], 1, 0));
+                    }
+                }
             }
+        }
+        SidebarTab::Search => {
+            let search_header = Paragraph::new(vec![
+                Line::from(Span::styled("PROMPT: ./SEARCH_BUFFER", Style::default().fg(TEXT_MUTED))),
+                Line::from(Span::styled("SEARCH BUFFER", Style::default().fg(TEXT_ACTIVE).add_modifier(Modifier::BOLD))),
+            ]);
+            f.render_widget(search_header, grid_layout[0]);
+
+            let placeholder = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  SEARCH BUFFER [UNDER CONSTRUCTION]",
+                    Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Full-text fuzzy search across catalog",
+                    Style::default().fg(SURFACE_HIGH),
+                )),
+                Line::from(Span::styled(
+                    "  incoming in the next release.",
+                    Style::default().fg(SURFACE_HIGH),
+                )),
+            ]);
+            f.render_widget(placeholder, grid_layout[1]);
+        }
+        SidebarTab::Library => {
+            let library_header = Paragraph::new(vec![
+                Line::from(Span::styled("PROMPT: ./FETCH_LIBRARY", Style::default().fg(TEXT_MUTED))),
+                Line::from(Span::styled("LIBRARY", Style::default().fg(TEXT_ACTIVE).add_modifier(Modifier::BOLD))),
+            ]);
+            f.render_widget(library_header, grid_layout[0]);
+
+            let placeholder = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  LIBRARY [UNDER CONSTRUCTION]",
+                    Style::default().fg(TEXT_MUTED).add_modifier(Modifier::ITALIC),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Personal playlist and saved tracks",
+                    Style::default().fg(SURFACE_HIGH),
+                )),
+                Line::from(Span::styled(
+                    "  incoming in the next release.",
+                    Style::default().fg(SURFACE_HIGH),
+                )),
+            ]);
+            f.render_widget(placeholder, grid_layout[1]);
         }
     }
 
@@ -684,21 +788,19 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
             Constraint::Length(4),   // [2] Track metadata
             Constraint::Length(2),   // [3] Progress bar
             Constraint::Length(3),   // [4] Controls
-            Constraint::Min(0),      // [5] spacer
+            Constraint::Min(0),      // [5] Spacer
             Constraint::Length(5),   // [6] System logs
         ]).split(columns[2]);
 
-    // Dynamic Header
     let status_text = if app.is_playing { "● NOW_PLAYING" } else if app.active_playing_track.is_some() { "⏸ PAUSED" } else { "● STANDBY" };
     let status_color = if app.is_playing { MAUVE } else { TEXT_MUTED };
     f.render_widget(Paragraph::new(Span::styled(status_text, Style::default().fg(status_color))), inspector_layout[0]);
-    
-    // Art Box — render the background block and store rect for Kitty rendering
+
+    // Store the art rect for post-render Kitty injection
     let art_rect = inset(inspector_layout[1], 0, 1);
     f.render_widget(Block::default().style(Style::default().bg(SURFACE_LOW)), art_rect);
     app.inspector_art_rect = Some(art_rect);
 
-    // Dynamic Metadata based on ACTIVE track (not just selected)
     let display_idx = app.active_playing_track.unwrap_or(app.selected_track);
     if !app.catalog.is_empty() {
         let t = &app.catalog[display_idx];
@@ -712,7 +814,7 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
         let progress_area = inspector_layout[3];
         if app.playback_duration > 0.0 {
             let pct = (app.playback_elapsed / app.playback_duration).clamp(0.0, 1.0);
-            let bar_width = progress_area.width.saturating_sub(14) as usize; // reserve space for timestamps
+            let bar_width = progress_area.width.saturating_sub(14) as usize;
             let filled = (pct * bar_width as f64) as usize;
             let empty = bar_width.saturating_sub(filled);
 
@@ -732,15 +834,13 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
             ]);
             f.render_widget(Paragraph::new(bar_line), progress_area);
         } else if app.playback_elapsed > 0.0 {
-            // Duration unknown — show elapsed time counting up with pulsing bar
+            // Duration not yet known — show pulsing elapsed
             let bar_width = progress_area.width.saturating_sub(14) as usize;
             let elapsed_min = (app.playback_elapsed as u64) / 60;
             let elapsed_sec = (app.playback_elapsed as u64) % 60;
-
-            // Animate a pulse: a small block that moves across the bar
             let pulse_pos = ((app.playback_elapsed as usize) * 2) % bar_width.max(1);
-            let mut bar_chars: Vec<Span> = Vec::new();
-            bar_chars.push(Span::styled(" ", Style::default()));
+
+            let mut bar_chars: Vec<Span> = vec![Span::styled(" ", Style::default())];
             for i in 0..bar_width {
                 if i >= pulse_pos && i < pulse_pos + 3 {
                     bar_chars.push(Span::styled("█", Style::default().fg(MAUVE)));
@@ -752,7 +852,6 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
                 format!(" {:02}:{:02}/??:??", elapsed_min, elapsed_sec),
                 Style::default().fg(TEXT_MUTED),
             ));
-
             f.render_widget(Paragraph::new(Line::from(bar_chars)), progress_area);
         } else {
             let bar_width = progress_area.width.saturating_sub(14) as usize;
@@ -764,26 +863,31 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &mut App) {
             f.render_widget(Paragraph::new(bar_line), progress_area);
         }
 
-        // Controls
         let play_icon = if app.is_playing { "⏸" } else { "▶" };
-        let controls = Paragraph::new(Span::styled(format!("🔀   ⏮    {}    ⏭    🔁", play_icon), Style::default().fg(TEXT_ACTIVE)));
+        let controls = Paragraph::new(Span::styled(
+            format!("🔀   ⏮    {}    ⏭    🔁", play_icon),
+            Style::default().fg(TEXT_ACTIVE),
+        ));
         f.render_widget(controls, inspector_layout[4]);
     }
 
-    // Dynamic System Logs
     let mut log_lines = Vec::new();
     for log in &app.system_logs {
         log_lines.push(Line::from(Span::styled(log, Style::default().fg(TEXT_MUTED))));
     }
-    let logs_widget = Paragraph::new(log_lines);
-    f.render_widget(logs_widget, inspector_layout[6]);
+    f.render_widget(Paragraph::new(log_lines), inspector_layout[6]);
 
     // 4. BOTTOM BAR
-    let bot_layout = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(main_layout[1]);
-    
+    let bot_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main_layout[1]);
+
     let play_status = if !app.catalog.is_empty() {
         format!(" ▶ PLAYING: {}.WAV ", app.catalog[app.selected_track].track.to_uppercase())
-    } else { " ▶ AWAITING_STREAM ".to_string() };
+    } else {
+        " ▶ AWAITING_STREAM ".to_string()
+    };
 
     f.render_widget(Paragraph::new(Span::styled(play_status, Style::default().fg(TEXT_ACTIVE).bg(SURFACE_HIGH))), inset(bot_layout[0], 0, 1));
     f.render_widget(Paragraph::new(Span::styled("⌨ COMMAND_PROMPT █", Style::default().fg(TEXT_ACTIVE))).alignment(Alignment::Right), inset(bot_layout[1], 0, 1));
@@ -798,142 +902,173 @@ fn inset(rect: Rect, dx: u16, dy: u16) -> Rect {
     }
 }
 
-fn handle_dashboard_input(key: KeyCode, app: &mut App) {
-    if app.catalog.is_empty() { return; }
-    match key {
-        KeyCode::Left =>  { if app.selected_track > 0 { app.selected_track -= 1; } }
-        KeyCode::Right => { if app.selected_track < app.catalog.len() - 1 { app.selected_track += 1; } }
-        KeyCode::Up =>    { if app.selected_track > 2 { app.selected_track -= 3; } }
-        KeyCode::Down =>  { if app.selected_track + 3 < app.catalog.len() { app.selected_track += 3; } }
-        
-        // --- MPV DAEMON CONTROLS ---
-        KeyCode::Enter => {
-            // Kill previous stream if any
-            app.kill_mpv();
-            // Clear previous cover art
-            clear_kitty_images();
-            app.cover_art_data = None;
+/// Shared play logic — triggered by both keyboard Enter and mouse click.
+fn handle_track_play(idx: usize, app: &mut App) {
+    if idx >= app.catalog.len() { return; }
 
-            app.active_playing_track = Some(app.selected_track);
-            app.is_playing = false; // Will be set to true when mpv actually spawns
+    app.kill_mpv();
+    clear_kitty_images();
+    app.cover_art_data = None;
+    app.kitty_rendered = false;
 
-            let track = &app.catalog[app.selected_track];
-            let track_name = track.track.clone();
-            let tenant = track.tenant.clone();
-            let file_key = track.file_key.clone();
-            let cover_key = track.cover_key.clone();
-            // Drop the immutable borrow on `track` before the mutable push_log call
-            drop(track);
+    app.selected_track = idx;
+    app.active_playing_track = Some(idx);
+    app.is_playing = false;
 
-            app.push_log(format!("[SYS] FETCHING PRE-SIGNED URL FOR: {}", track_name.to_uppercase()));
+    let track_name = app.catalog[idx].track.clone();
+    let tenant = app.catalog[idx].tenant.clone();
+    let file_key = app.catalog[idx].file_key.clone();
+    let cover_key = app.catalog[idx].cover_key.clone();
 
-            // Fire async task to fetch the S3 URL from the Python broker
-            let tx = app.bg_tx.clone();
-            let tenant_for_stream = tenant.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(BackgroundEvent::Log("[SYS] BROKER HANDSHAKE...".to_string())).await;
+    app.push_log(format!("[SYS] FETCHING PRE-SIGNED URL FOR: {}", track_name.to_uppercase()));
 
-                let output = tokio::process::Command::new("python")
-                    .arg("../backend.py")
-                    .arg("stream")
-                    .arg(&tenant_for_stream)
-                    .arg(&file_key)
-                    .output()
-                    .await;
+    // Fetch audio stream URL
+    let tx = app.bg_tx.clone();
+    let tenant_for_stream = tenant.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(BackgroundEvent::Log("[SYS] BROKER HANDSHAKE...".to_string())).await;
+        let output = tokio::process::Command::new("python")
+            .arg("../backend.py")
+            .arg("stream")
+            .arg(&tenant_for_stream)
+            .arg(&file_key)
+            .output()
+            .await;
 
-                match output {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        match serde_json::from_str::<StreamResponse>(&stdout) {
-                            Ok(resp) if resp.status == "success" => {
-                                if let Some(url) = resp.url {
-                                    let _ = tx.send(BackgroundEvent::StreamReady(url)).await;
-                                } else {
-                                    let _ = tx.send(BackgroundEvent::StreamError("NO URL IN RESPONSE".to_string())).await;
-                                }
-                            }
-                            Ok(resp) => {
-                                let msg = resp.message.unwrap_or("BROKER RETURNED ERROR".to_string());
-                                let _ = tx.send(BackgroundEvent::StreamError(msg.to_uppercase())).await;
-                            }
-                            Err(_) => {
-                                let _ = tx.send(BackgroundEvent::StreamError("INVALID JSON FROM BROKER".to_string())).await;
-                            }
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                match serde_json::from_str::<StreamResponse>(&stdout) {
+                    Ok(resp) if resp.status == "success" => {
+                        if let Some(url) = resp.url {
+                            let _ = tx.send(BackgroundEvent::StreamReady(url)).await;
+                        } else {
+                            let _ = tx.send(BackgroundEvent::StreamError("NO URL IN RESPONSE".to_string())).await;
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(BackgroundEvent::StreamError(format!("BROKER EXEC FAILED: {}", e))).await;
+                    Ok(resp) => {
+                        let msg = resp.message.unwrap_or("BROKER RETURNED ERROR".to_string());
+                        let _ = tx.send(BackgroundEvent::StreamError(msg.to_uppercase())).await;
+                    }
+                    Err(_) => {
+                        let _ = tx.send(BackgroundEvent::StreamError("INVALID JSON FROM BROKER".to_string())).await;
                     }
                 }
-            });
+            }
+            Err(e) => {
+                let _ = tx.send(BackgroundEvent::StreamError(format!("BROKER EXEC FAILED: {}", e))).await;
+            }
+        }
+    });
 
-            // --- FETCH COVER ART (Kitty Graphics) ---
-            if cover_key != "NONE" && !cover_key.is_empty() {
-                let tx2 = app.bg_tx.clone();
-                let tenant2 = tenant.clone();
-                let cover_key2 = cover_key.clone();
-                tokio::spawn(async move {
-                    let _ = tx2.send(BackgroundEvent::Log("[SYS] FETCHING COVER ART...".to_string())).await;
+    // Fetch cover art
+    if cover_key != "NONE" && !cover_key.is_empty() {
+        let tx2 = app.bg_tx.clone();
+        let tenant2 = tenant.clone();
+        let cover_key2 = cover_key.clone();
+        tokio::spawn(async move {
+            let _ = tx2.send(BackgroundEvent::Log("[SYS] FETCHING COVER ART...".to_string())).await;
+            let output = tokio::process::Command::new("python")
+                .arg("../backend.py")
+                .arg("stream")
+                .arg(&tenant2)
+                .arg(&cover_key2)
+                .output()
+                .await;
 
-                    // Get presigned URL for cover image via backend broker
-                    let output = tokio::process::Command::new("python")
-                        .arg("../backend.py")
-                        .arg("stream")
-                        .arg(&tenant2)
-                        .arg(&cover_key2)
-                        .output()
-                        .await;
-
-                    match output {
-                        Ok(out) => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            if let Ok(resp) = serde_json::from_str::<StreamResponse>(&stdout) {
-                                if resp.status == "success" {
-                                    if let Some(url) = resp.url {
-                                        // Download the image bytes
-                                        match reqwest::get(&url).await {
-                                            Ok(response) => {
-                                                match response.bytes().await {
-                                                    Ok(bytes) => {
-                                                        let _ = tx2.send(BackgroundEvent::CoverArtReady(bytes.to_vec())).await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER DOWNLOAD FAILED: {}", e))).await;
-                                                    }
-                                                }
+            match output {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if let Ok(resp) = serde_json::from_str::<StreamResponse>(&stdout) {
+                        if resp.status == "success" {
+                            if let Some(url) = resp.url {
+                                match reqwest::get(&url).await {
+                                    Ok(response) => {
+                                        match response.bytes().await {
+                                            Ok(bytes) => {
+                                                let _ = tx2.send(BackgroundEvent::CoverArtReady(bytes.to_vec())).await;
                                             }
                                             Err(e) => {
-                                                let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER FETCH FAILED: {}", e))).await;
+                                                let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER DOWNLOAD FAILED: {}", e))).await;
                                             }
                                         }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER FETCH FAILED: {}", e))).await;
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER BROKER FAILED: {}", e))).await;
-                        }
                     }
-                });
+                }
+                Err(e) => {
+                    let _ = tx2.send(BackgroundEvent::Log(format!("[ERR] COVER BROKER FAILED: {}", e))).await;
+                }
+            }
+        });
+    }
+}
+
+fn handle_dashboard_input(key: KeyCode, app: &mut App) {
+    match key {
+        // --- SIDEBAR TAB SWITCHING ---
+        KeyCode::Char('h') | KeyCode::Char('H') => { app.active_tab = SidebarTab::Home; }
+        KeyCode::Char('s') | KeyCode::Char('S') => { app.active_tab = SidebarTab::Search; }
+        KeyCode::Char('l') | KeyCode::Char('L') => { app.active_tab = SidebarTab::Library; }
+
+        _ => {
+            if app.catalog.is_empty() { return; }
+            match key {
+                KeyCode::Left  => { if app.selected_track > 0 { app.selected_track -= 1; } }
+                KeyCode::Right => { if app.selected_track < app.catalog.len() - 1 { app.selected_track += 1; } }
+                KeyCode::Up    => { if app.selected_track > 2 { app.selected_track -= 3; } }
+                KeyCode::Down  => { if app.selected_track + 3 < app.catalog.len() { app.selected_track += 3; } }
+                KeyCode::Enter => {
+                    let idx = app.selected_track;
+                    handle_track_play(idx, app);
+                }
+                KeyCode::Char(' ') => {
+                    // Native MPV IPC pause/resume
+                    if app.mpv_child.is_some() {
+                        let tx = app.bg_tx.clone();
+                        tokio::spawn(async move {
+                            match UnixStream::connect("/tmp/termstream_mpv.sock").await {
+                                Ok(mut stream) => {
+                                    let cmd = "{\"command\":[\"cycle\",\"pause\"]}\n";
+                                    let _ = stream.write_all(cmd.as_bytes()).await;
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(BackgroundEvent::Log(
+                                        format!("[ERR] PAUSE IPC FAILED: {}", e)
+                                    )).await;
+                                }
+                            }
+                        });
+                    }
+                }
+                _ => {}
             }
         }
-        KeyCode::Char(' ') => {
-            // --- NATIVE MPV IPC PAUSE/RESUME ---
-            if app.mpv_child.is_some() {
-                let tx = app.bg_tx.clone();
-                tokio::spawn(async move {
-                    match UnixStream::connect("/tmp/termstream_mpv.sock").await {
-                        Ok(mut stream) => {
-                            let cmd = "{\"command\":[\"cycle\",\"pause\"]}\n";
-                            let _ = stream.write_all(cmd.as_bytes()).await;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(BackgroundEvent::Log(format!("[ERR] PAUSE IPC FAILED: {}", e))).await;
-                        }
-                    }
-                });
+    }
+}
+
+fn handle_mouse_input(mouse: MouseEvent, app: &mut App) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    let col = mouse.column;
+    let row = mouse.row;
+
+    // Hit-test against cached grid cell rects (only populated while Home tab is active)
+    for (idx, rect) in app.grid_cell_rects.iter().enumerate() {
+        if col >= rect.x && col < rect.x + rect.width
+            && row >= rect.y && row < rect.y + rect.height
+        {
+            if idx < app.catalog.len() {
+                handle_track_play(idx, app);
             }
+            return;
         }
-        _ => {}
     }
 }
