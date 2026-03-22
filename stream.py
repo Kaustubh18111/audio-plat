@@ -11,13 +11,14 @@ Fixes vs v2.0:
   - Fuzzy search mode (/ or s key) with live filtering
 
 Dependencies:
-    pip install rich boto3 readchar requests
+    pip install rich boto3 requests pillow
 """
 
 from __future__ import annotations
 
 import base64
 import getpass
+import io
 import json
 import os
 import re
@@ -27,13 +28,18 @@ import subprocess
 import sys
 import threading
 import time
+import termios
+import tty
 from dataclasses import dataclass, field
 from typing import Optional
 
 import boto3
-import readchar
 import requests
 from botocore.exceptions import ClientError, NoCredentialsError
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 from rich import box
 from rich.align import Align
 from rich.console import Console
@@ -138,6 +144,10 @@ class AppState:
     catalog_row0: int = 5     # terminal row where catalog rows start (1-based)
     sidebar_w:    int = 24    # columns wide (approx 20% of term_w)
     inspector_x:  int = 91    # column where inspector starts (approx 75%)
+    sidebar_nav_rows: dict[str, int] = field(default_factory=dict)
+    catalog_win_start: int = 0
+    catalog_win_rows:  int = 0
+    supports_mouse: bool = False
 
     # UI signals
     needs_redraw: bool     = True
@@ -145,8 +155,44 @@ class AppState:
     logs:         list[str] = field(default_factory=list)
     status_msg:   str      = "[SYS] KERNEL BOOT..."
 
-    # Thread lock for state mutations from mouse/keyboard threads
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Cached visible entries: list of (full_catalog_idx, Track)
+    _visible_cache_key: Optional[tuple] = None
+    _visible_cache: list[tuple[int, Track]] = field(default_factory=list)
+
+    # Thread lock for state mutations from input/progress/render threads
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
+def _visible_entries_locked(state: AppState) -> list[tuple[int, Track]]:
+    """
+    Return visible entries as (full_catalog_idx, Track).
+    Caller must hold state._lock.
+    """
+    key = (
+        state.active_tab,
+        state.search_query.lower(),
+        state.username,
+        id(state.catalog),
+        len(state.catalog),
+    )
+    if key == state._visible_cache_key:
+        return state._visible_cache
+
+    if state.active_tab == TAB_SETTINGS:
+        entries: list[tuple[int, Track]] = []
+    else:
+        entries = []
+        q = state.search_query.lower() if state.search_query else ""
+        for full_idx, track in enumerate(state.catalog):
+            if state.active_tab == TAB_LIBRARY and track.tenant != state.username:
+                continue
+            if q and q not in track.track.lower() and q not in track.artist.lower():
+                continue
+            entries.append((full_idx, track))
+
+    state._visible_cache_key = key
+    state._visible_cache = entries
+    return entries
 
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -197,21 +243,8 @@ def visible_tracks(state: AppState) -> list[Track]:
     Library tab filters by TenantID == current user (not Artist/ID3 tags).
     Search filters the active view by track name or artist (case-insensitive).
     """
-    if state.active_tab == TAB_SETTINGS:
-        return []
-
-    if state.active_tab == TAB_LIBRARY:
-        base = [t for t in state.catalog if t.tenant == state.username]
-    else:
-        base = list(state.catalog)
-
-    if state.search_query:
-        q = state.search_query.lower()
-        base = [
-            t for t in base
-            if q in t.track.lower() or q in t.artist.lower()
-        ]
-    return base
+    with state._lock:
+        return [track for _, track in _visible_entries_locked(state)]
 
 
 def presign(tenant: str, key: str) -> Optional[str]:
@@ -284,20 +317,24 @@ def mpv_get_property(prop: str) -> Optional[float]:
 
 
 def kill_mpv(state: AppState):
-    if state.mpv_proc:
+    with state._lock:
+        proc = state.mpv_proc
+        state.mpv_proc = None
+
+    if proc:
         try:
-            state.mpv_proc.kill()
-            state.mpv_proc.wait(timeout=2)
+            proc.kill()
+            proc.wait(timeout=2)
         except Exception:
             pass
-        state.mpv_proc = None
     try:
         os.remove(MPV_SOCK)
     except FileNotFoundError:
         pass
-    state.is_playing = False
-    state.elapsed    = 0.0
-    state.duration   = 0.0
+    with state._lock:
+        state.is_playing = False
+        state.elapsed    = 0.0
+        state.duration   = 0.0
 
 
 def spawn_mpv(state: AppState, url: str):
@@ -308,50 +345,72 @@ def spawn_mpv(state: AppState, url: str):
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    state.mpv_proc   = proc
-    state.is_playing = True
-    state.elapsed    = 0.0
-    state.duration   = 0.0
+    with state._lock:
+        state.mpv_proc   = proc
+        state.is_playing = True
+        state.elapsed    = 0.0
+        state.duration   = 0.0
 
 
 def play_track(state: AppState, full_catalog_idx: int):
     """Spawn MPV for the track at full_catalog_idx."""
-    track = state.catalog[full_catalog_idx]
-    push_log(state, f"[SYS] LOADING: {track.track.upper()}")
+    with state._lock:
+        if not (0 <= full_catalog_idx < len(state.catalog)):
+            return
+        track = state.catalog[full_catalog_idx]
+        push_log(state, f"[SYS] LOADING: {track.track.upper()}")
+        state.needs_redraw = True
+
     url = presign(track.tenant, track.file_key)
     if url:
         spawn_mpv(state, url)
-        state.playing_idx = full_catalog_idx
-        state.cover_bytes = None
-        state.cover_track = None
-        push_log(state, f"[OK] STREAMING: {track.track.upper()}")
+        with state._lock:
+            state.playing_idx = full_catalog_idx
+            state.cover_bytes = None
+            state.cover_track = None
+            push_log(state, f"[OK] STREAMING: {track.track.upper()}")
+            state.needs_redraw = True
     else:
-        push_log(state, "[ERR] PRESIGN FAILED — CHECK IAM/S3")
-    state.needs_redraw = True
+        with state._lock:
+            push_log(state, "[ERR] PRESIGN FAILED — CHECK IAM/S3")
+            state.needs_redraw = True
 
 
 # ─── BACKGROUND THREADS ───────────────────────────────────────────────────────
 
 def _progress_thread(state: AppState):
     while not state.quit:
-        if state.is_playing and state.mpv_proc:
-            if state.mpv_proc.poll() is not None:
-                state.is_playing   = False
-                state.playing_idx  = None
-                state.elapsed      = 0.0
-                state.needs_redraw = True
+        with state._lock:
+            is_playing = state.is_playing
+            mpv_proc = state.mpv_proc
+
+        if is_playing and mpv_proc:
+            if mpv_proc.poll() is not None:
+                with state._lock:
+                    state.is_playing   = False
+                    state.playing_idx  = None
+                    state.elapsed      = 0.0
+                    state.duration     = 0.0
+                    state.needs_redraw = True
             else:
                 pos = mpv_get_property("time-pos")
                 dur = mpv_get_property("duration")
-                changed = False
-                if pos is not None and abs(pos - state.elapsed) > 0.3:
-                    state.elapsed = float(pos)
-                    changed = True
-                if dur is not None and dur != state.duration:
-                    state.duration = float(dur)
-                    changed = True
-                if changed:
-                    state.needs_redraw = True
+                paused = mpv_get_property("pause")
+                with state._lock:
+                    changed = False
+                    if isinstance(pos, (int, float)) and abs(float(pos) - state.elapsed) > 0.3:
+                        state.elapsed = float(pos)
+                        changed = True
+                    if isinstance(dur, (int, float)) and float(dur) != state.duration:
+                        state.duration = float(dur)
+                        changed = True
+                    if isinstance(paused, bool):
+                        real_playing = not paused
+                        if state.is_playing != real_playing:
+                            state.is_playing = real_playing
+                            changed = True
+                    if changed:
+                        state.needs_redraw = True
         time.sleep(0.5)
 
 
@@ -362,8 +421,18 @@ def _cover_thread(state: AppState, full_idx: int, tenant: str, cover_key: str):
     try:
         resp = requests.get(url, timeout=8)
         if resp.ok:
+            if Image is not None:
+                try:
+                    with Image.open(io.BytesIO(resp.content)) as img:
+                        out = io.BytesIO()
+                        img.save(out, format="PNG")
+                        image_bytes = out.getvalue()
+                except Exception:
+                    image_bytes = resp.content
+            else:
+                image_bytes = resp.content
             with state._lock:
-                state.cover_bytes  = resp.content
+                state.cover_bytes  = image_bytes
                 state.cover_track  = full_idx
                 state.needs_redraw = True
     except Exception:
@@ -386,6 +455,21 @@ def disable_mouse():
     sys.stdout.flush()
 
 
+def supports_sgr_mouse() -> bool:
+    term = os.environ.get("TERM", "").lower()
+    term_program = os.environ.get("TERM_PROGRAM", "").lower()
+    return (
+        "xterm" in term
+        or "kitty" in term
+        or "alacritty" in term
+        or "wezterm" in term
+        or "vte" in term
+        or "screen" in term
+        or "tmux" in term
+        or "kitty" in term_program
+    )
+
+
 def handle_mouse_event(state: AppState, btn: int, col: int, row: int, pressed: bool):
     """
     Hit detection for mouse clicks on the rendered layout.
@@ -395,78 +479,248 @@ def handle_mouse_event(state: AppState, btn: int, col: int, row: int, pressed: b
     if not pressed or btn != 0:
         return
 
-    tw = state.term_w
-
-    # Sidebar boundary (first ~20% of terminal width)
-    sidebar_end = max(state.sidebar_w, int(tw * 0.20))
+    with state._lock:
+        tw = state.term_w
+        sidebar_end = max(state.sidebar_w, int(tw * 0.20))
+        inspector_x = state.inspector_x
+        active_tab = state.active_tab
+        nav_rows = dict(state.sidebar_nav_rows)
+        catalog_row0 = state.catalog_row0
+        win_start = state.catalog_win_start
+        win_rows = state.catalog_win_rows
+        vis = _visible_entries_locked(state)
 
     if col <= sidebar_end:
-        # ── SIDEBAR HIT ──────────────────────────────────────────────────────
-        # Sidebar nav rows are at fixed offsets in the sidebar panel.
-        # Header takes row 1 (panel title); nav items start at row 4.
-        if row == 4:
+        if row == nav_rows.get(TAB_CATALOG):
             with state._lock:
                 state.active_tab   = TAB_CATALOG
                 state.search_mode  = False
                 state.search_query = ""
                 state.selected_idx = 0
                 state.needs_redraw = True
-        elif row == 6:
+        elif row == nav_rows.get(TAB_LIBRARY):
             with state._lock:
                 state.active_tab   = TAB_LIBRARY
                 state.search_mode  = False
                 state.search_query = ""
                 state.selected_idx = 0
                 state.needs_redraw = True
-        elif row == 8:
+        elif row == nav_rows.get(TAB_SETTINGS):
             with state._lock:
                 state.active_tab   = TAB_SETTINGS
                 state.search_mode  = False
                 state.search_query = ""
                 state.needs_redraw = True
 
-    elif col < state.inspector_x:
-        # ── CATALOG GRID HIT ─────────────────────────────────────────────────
-        if state.active_tab == TAB_SETTINGS:
+    elif col < inspector_x:
+        if active_tab == TAB_SETTINGS:
             return
-        # Catalog table body starts after header row (row 3 header, row 4 separator = first data row 5)
-        # catalog_row0 is updated every render
-        data_row = row - state.catalog_row0
+        data_row = row - catalog_row0
         if data_row < 0:
             return
 
-        vis = visible_tracks(state)
-        # Account for windowing: the visible window starts at max(0, selected - half)
-        visible_rows = max(state.term_h - 8, 3)
-        half         = visible_rows // 2
-        win_start    = max(0, state.selected_idx - half)
-        win_start    = max(0, min(win_start, max(0, len(vis) - visible_rows)))
-
+        if data_row >= win_rows:
+            return
         clicked_vis_idx = win_start + data_row
         if 0 <= clicked_vis_idx < len(vis):
-            clicked_track = vis[clicked_vis_idx]
-            # Find this track's full_catalog index
-            try:
-                full_idx = state.catalog.index(clicked_track)
-            except ValueError:
-                full_idx = None
-
+            full_idx, _ = vis[clicked_vis_idx]
             with state._lock:
                 state.selected_idx = clicked_vis_idx
                 state.needs_redraw = True
-
-            if full_idx is not None:
-                play_track(state, full_idx)
+            play_track(state, full_idx)
 
 
-def _mouse_input_thread(state: AppState):
-    """
-    Reads raw bytes from stdin looking for SGR mouse sequences.
-    Runs alongside the keyboard thread.
-    """
+# ─── UNIFIED INPUT THREAD ────────────────────────────────────────────────────
+
+KEY_ESC = "__ESC__"
+KEY_UP = "__UP__"
+KEY_DOWN = "__DOWN__"
+KEY_ENTER = "__ENTER__"
+KEY_BACKSPACE = "__BACKSPACE__"
+KEY_SPACE = "__SPACE__"
+
+
+def _decode_stdin_events(buffer: bytearray, mouse_enabled: bool) -> list[tuple]:
+    events: list[tuple] = []
+    i = 0
+
+    while i < len(buffer):
+        b = buffer[i]
+
+        if mouse_enabled and b == 0x1B and i + 2 < len(buffer) and buffer[i + 1] == ord("[") and buffer[i + 2] == ord("<"):
+            j = i + 3
+            while j < len(buffer) and buffer[j] not in (ord("M"), ord("m")):
+                j += 1
+            if j >= len(buffer):
+                break
+            seq = bytes(buffer[i:j + 1]).decode("utf-8", errors="ignore")
+            m = _MOUSE_RE.fullmatch(seq)
+            if m:
+                events.append(("mouse", int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == "M"))
+            i = j + 1
+            continue
+
+        if b == 0x1B:
+            if i + 2 < len(buffer) and buffer[i + 1] == ord("["):
+                code = buffer[i + 2]
+                if code == ord("A"):
+                    events.append(("key", KEY_UP))
+                    i += 3
+                    continue
+                if code == ord("B"):
+                    events.append(("key", KEY_DOWN))
+                    i += 3
+                    continue
+            events.append(("key", KEY_ESC))
+            i += 1
+            continue
+
+        if b in (10, 13):
+            events.append(("key", KEY_ENTER))
+            i += 1
+            continue
+        if b in (8, 127):
+            events.append(("key", KEY_BACKSPACE))
+            i += 1
+            continue
+        if b == ord(" "):
+            events.append(("key", KEY_SPACE))
+            i += 1
+            continue
+
+        if b < 128:
+            ch = chr(b)
+            if ch.isprintable():
+                events.append(("key", ch))
+            i += 1
+            continue
+
+        decoded = None
+        for n in (2, 3, 4):
+            if i + n > len(buffer):
+                break
+            try:
+                decoded = bytes(buffer[i:i + n]).decode("utf-8")
+                i += n
+                break
+            except UnicodeDecodeError:
+                continue
+        if decoded is None:
+            break
+        if decoded.isprintable():
+            events.append(("key", decoded))
+
+    if i:
+        del buffer[:i]
+    return events
+
+
+def _normalize_indexes_locked(state: AppState):
+    entries = _visible_entries_locked(state)
+    if state.selected_idx >= len(entries):
+        state.selected_idx = max(0, len(entries) - 1)
+    if state.playing_idx is not None and not (0 <= state.playing_idx < len(state.catalog)):
+        state.playing_idx = None
+        state.is_playing = False
+        state.elapsed = 0.0
+        state.duration = 0.0
+    if state.cover_track is not None and not (0 <= state.cover_track < len(state.catalog)):
+        state.cover_track = None
+        state.cover_bytes = None
+
+
+def _handle_key_event(state: AppState, key: str):
+    play_request: Optional[int] = None
+    reload_request = False
+    toggle_pause = False
+
+    with state._lock:
+        if state.search_mode:
+            if key == KEY_ESC:
+                state.search_mode  = False
+                state.search_query = ""
+                state.selected_idx = 0
+            elif key == KEY_BACKSPACE:
+                state.search_query = state.search_query[:-1]
+                state.selected_idx = 0
+            elif key == KEY_ENTER:
+                state.search_mode  = False
+            elif len(key) == 1 and key.isprintable():
+                state.search_query += key
+                state.selected_idx  = 0
+            state.needs_redraw = True
+            return
+
+        if key in (KEY_ESC, "q", "Q"):
+            state.quit = True
+            return
+
+        if key in ("/", "s", "S"):
+            state.search_mode  = True
+            state.search_query = ""
+            state.selected_idx = 0
+            state.needs_redraw = True
+            return
+
+        entries = _visible_entries_locked(state)
+
+        if key == KEY_UP:
+            if entries:
+                state.selected_idx = max(0, state.selected_idx - 1)
+                state.needs_redraw = True
+        elif key == KEY_DOWN:
+            if entries:
+                state.selected_idx = min(len(entries) - 1, state.selected_idx + 1)
+                state.needs_redraw = True
+        elif key == KEY_ENTER:
+            if state.active_tab != TAB_SETTINGS and entries and state.selected_idx < len(entries):
+                play_request = entries[state.selected_idx][0]
+        elif key == KEY_SPACE:
+            if state.mpv_proc and state.mpv_proc.poll() is None:
+                toggle_pause = True
+        elif key == "1":
+            state.active_tab   = TAB_CATALOG
+            state.selected_idx = 0
+            state.needs_redraw = True
+        elif key == "2":
+            state.active_tab   = TAB_LIBRARY
+            state.selected_idx = 0
+            state.needs_redraw = True
+        elif key == "3":
+            state.active_tab   = TAB_SETTINGS
+            state.needs_redraw = True
+        elif key in ("r", "R"):
+            push_log(state, "[SYS] RELOADING CATALOG...")
+            state.needs_redraw = True
+            reload_request = True
+
+    if toggle_pause:
+        mpv_cycle_pause()
+        paused = mpv_get_property("pause")
+        with state._lock:
+            if isinstance(paused, bool):
+                state.is_playing = not paused
+            state.needs_redraw = True
+
+    if play_request is not None:
+        play_track(state, play_request)
+
+    if reload_request:
+        refreshed = fetch_catalog()
+        with state._lock:
+            state.catalog = refreshed
+            state.selected_idx = 0
+            _normalize_indexes_locked(state)
+            push_log(state, f"[OK] CATALOG READY — {len(state.catalog)} TRACKS")
+            state.needs_redraw = True
+
+
+def _input_thread(state: AppState):
     import select
+
     fd = sys.stdin.fileno()
-    buf = b""
+    buffer = bytearray()
+
     while not state.quit:
         r, _, _ = select.select([fd], [], [], 0.05)
         if not r:
@@ -474,107 +728,21 @@ def _mouse_input_thread(state: AppState):
         try:
             chunk = os.read(fd, 256)
         except Exception:
-            break
-        buf += chunk
-        decoded = buf.decode("utf-8", errors="replace")
-        for m in _MOUSE_RE.finditer(decoded):
-            btn     = int(m.group(1))
-            col     = int(m.group(2))
-            row     = int(m.group(3))
-            pressed = m.group(4) == "M"
-            handle_mouse_event(state, btn, col, row, pressed)
-        # Trim consumed sequences
-        buf = b""
-
-
-# ─── KEYBOARD THREAD ─────────────────────────────────────────────────────────
-
-def _keyboard_thread(state: AppState):
-    while not state.quit:
-        try:
-            key = readchar.readkey()
-        except Exception:
-            state.quit = True
-            break
-
-        with state._lock:
-            # ── SEARCH MODE ────────────────────────────────────────────────
-            if state.search_mode:
-                if key == readchar.key.ESC:
-                    state.search_mode  = False
-                    state.search_query = ""
-                    state.selected_idx = 0
-                elif key in (readchar.key.BACKSPACE, "\x7f"):
-                    state.search_query = state.search_query[:-1]
-                    state.selected_idx = 0
-                elif key == readchar.key.ENTER:
-                    state.search_mode  = False
-                elif len(key) == 1 and key.isprintable():
-                    state.search_query += key
-                    state.selected_idx  = 0
-                state.needs_redraw = True
-                continue
-
-            # ── NORMAL MODE ────────────────────────────────────────────────
-            if key in (readchar.key.ESC, "q", "Q"):
+            with state._lock:
                 state.quit = True
-                break
+            break
+        if not chunk:
+            continue
 
-            elif key in ("/", "s", "S"):
-                state.search_mode  = True
-                state.search_query = ""
-                state.selected_idx = 0
-                state.needs_redraw = True
-
-            elif key == readchar.key.UP:
-                vis = visible_tracks(state)
-                if vis:
-                    state.selected_idx = max(0, state.selected_idx - 1)
-                    state.needs_redraw = True
-
-            elif key == readchar.key.DOWN:
-                vis = visible_tracks(state)
-                if vis:
-                    state.selected_idx = min(len(vis) - 1, state.selected_idx + 1)
-                    state.needs_redraw = True
-
-            elif key == readchar.key.ENTER:
-                vis = visible_tracks(state)
-                if state.active_tab != TAB_SETTINGS and vis and state.selected_idx < len(vis):
-                    clicked_track = vis[state.selected_idx]
-                    try:
-                        full_idx = state.catalog.index(clicked_track)
-                        play_track(state, full_idx)
-                    except ValueError:
-                        pass
-
-            elif key == " ":
-                if state.mpv_proc and state.mpv_proc.poll() is None:
-                    mpv_cycle_pause()
-                    state.is_playing  = not state.is_playing
-                    state.needs_redraw = True
-
-            elif key in ("1",):
-                state.active_tab   = TAB_CATALOG
-                state.selected_idx = 0
-                state.needs_redraw = True
-
-            elif key in ("2",):
-                state.active_tab   = TAB_LIBRARY
-                state.selected_idx = 0
-                state.needs_redraw = True
-
-            elif key in ("3",):
-                state.active_tab   = TAB_SETTINGS
-                state.needs_redraw = True
-
-            elif key in ("r", "R"):
-                push_log(state, "[SYS] RELOADING CATALOG...")
-                state.needs_redraw = True
-                state.catalog      = fetch_catalog()
-                state.selected_idx = 0
-                push_log(state, f"[OK] CATALOG READY — {len(state.catalog)} TRACKS")
-                state.needs_redraw = True
+        buffer.extend(chunk)
+        events = _decode_stdin_events(buffer, mouse_enabled=state.supports_mouse)
+        for event in events:
+            if event[0] == "mouse":
+                _, btn, col, row, pressed = event
+                handle_mouse_event(state, btn, col, row, pressed)
+            else:
+                _, key = event
+                _handle_key_event(state, key)
 
 
 # ─── KITTY INJECTION ─────────────────────────────────────────────────────────
@@ -611,7 +779,7 @@ def clear_kitty():
 
 def build_header(state: AppState) -> Panel:
     play_icon = ""
-    if state.playing_idx is not None and state.catalog:
+    if state.playing_idx is not None and 0 <= state.playing_idx < len(state.catalog):
         t = state.catalog[state.playing_idx]
         icon = "▶" if state.is_playing else "⏸"
         play_icon = f"  {icon} {t.track.upper()} · {t.artist.upper()}"
@@ -661,7 +829,7 @@ def build_sidebar(state: AppState) -> Panel:
 
 
 def build_catalog(state: AppState, height: int) -> Panel:
-    vis = visible_tracks(state)
+    entries = _visible_entries_locked(state)
 
     # Search mode header
     title_parts: list = [f"[{MAUVE}]"]
@@ -689,25 +857,25 @@ def build_catalog(state: AppState, height: int) -> Panel:
     t.add_column("ARTIST",  ratio=3,   no_wrap=True)
     t.add_column("RELEASE", ratio=3,   no_wrap=True)
 
-    if not vis:
+    if not entries:
         msg = "  No results." if state.search_query else "  No tracks. Press R to reload."
         t.add_row("—", msg, "", "")
+        state.catalog_win_start = 0
+        state.catalog_win_rows = 0
     else:
         visible_rows = max(height - 8, 4)
         half         = visible_rows // 2
         start        = max(0, state.selected_idx - half)
-        end          = min(len(vis), start + visible_rows)
+        end          = min(len(entries), start + visible_rows)
         start        = max(0, end - visible_rows)
 
+        state.catalog_win_start = start
+        state.catalog_win_rows = end - start
+
         for vi in range(start, end):
-            track     = vis[vi]
+            full_idx, track = entries[vi]
             is_sel    = vi == state.selected_idx
-            # Find if this track is the one currently playing
-            try:
-                full_idx  = state.catalog.index(track)
-                is_play   = full_idx == state.playing_idx
-            except ValueError:
-                is_play = False
+            is_play   = full_idx == state.playing_idx
 
             cursor     = "█ " if is_sel else "  "
             num_style  = Style(color=OVERLAY)
@@ -764,13 +932,9 @@ def build_inspector(state: AppState) -> tuple[Panel, Panel]:
     # Metadata
     focus_full = state.playing_idx
     if focus_full is None and state.catalog:
-        vis = visible_tracks(state)
-        if vis and state.selected_idx < len(vis):
-            t = vis[state.selected_idx]
-            try:
-                focus_full = state.catalog.index(t)
-            except ValueError:
-                pass
+        entries = _visible_entries_locked(state)
+        if entries and state.selected_idx < len(entries):
+            focus_full = entries[state.selected_idx][0]
 
     if focus_full is not None and focus_full < len(state.catalog):
         tr = state.catalog[focus_full]
@@ -799,7 +963,9 @@ def build_footer(state: AppState) -> Panel:
     dur     = int(state.duration)
     em, es  = divmod(elapsed, 60)
     dm, ds  = divmod(dur,     60)
-    bar_w   = max(state.term_w - 28, 8)
+    inner_w = max(state.term_w - 4, 16)  # panel borders + horizontal padding
+    # " {icon} " + " {mm:ss/mm:ss} " = 3 + 13 chars
+    bar_w   = max(inner_w - 16, 8)
 
     if dur > 0:
         filled   = int((state.elapsed / state.duration) * bar_w)
@@ -849,11 +1015,26 @@ def run_auth(console: Console) -> Optional[dict]:
         box=box.SIMPLE_HEAD,
         width=58,
     ))
+    fd = sys.stdin.fileno()
+    saved_attrs = None
     try:
+        saved_attrs = termios.tcgetattr(fd)
+    except Exception:
+        saved_attrs = None
+
+    try:
+        if saved_attrs is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved_attrs)
         username = input("  IDENTITY   : ")
         password = getpass.getpass("  ACCESS_KEY : ")
     except (EOFError, KeyboardInterrupt):
         return None
+    finally:
+        if saved_attrs is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved_attrs)
+            except Exception:
+                pass
 
     console.print(f"\n  [{OVERLAY}][SYS] HANDSHAKE WITH COGNITO...[/{OVERLAY}]")
     try:
@@ -878,115 +1059,154 @@ def run_auth(console: Console) -> Optional[dict]:
 # ─── MAIN RENDER LOOP ─────────────────────────────────────────────────────────
 
 def run_dashboard(console: Console, state: AppState):
-    enable_mouse()
-    hide_cursor()
+    fd = sys.stdin.fileno()
+    saved_attrs = None
+    mouse_enabled = supports_sgr_mouse()
+    state.supports_mouse = mouse_enabled
 
-    # Start background threads
-    threading.Thread(target=_progress_thread, args=(state,), daemon=True).start()
-    threading.Thread(target=_keyboard_thread, args=(state,), daemon=True).start()
-    threading.Thread(target=_mouse_input_thread, args=(state,), daemon=True).start()
+    try:
+        try:
+            saved_attrs = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            saved_attrs = None
 
-    cover_spinner: Optional[threading.Thread] = None
+        if mouse_enabled:
+            enable_mouse()
+        hide_cursor()
 
-    while not state.quit:
-        if not state.needs_redraw:
-            time.sleep(0.016)
-            continue
+        threading.Thread(target=_progress_thread, args=(state,), daemon=True).start()
+        threading.Thread(target=_input_thread, args=(state,), daemon=True).start()
 
-        state.needs_redraw = False
+        cover_spinner: Optional[threading.Thread] = None
 
-        # ── Terminal size ───────────────────────────────────────────────────
-        sz           = shutil.get_terminal_size((120, 36))
-        state.term_w = sz.columns
-        state.term_h = sz.lines
+        while True:
+            with state._lock:
+                if state.quit:
+                    break
+                needs_redraw = state.needs_redraw
 
-        # Update geometry hints for mouse hit-detection
-        state.sidebar_w   = max(int(state.term_w * 0.20), 20)
-        state.inspector_x = max(int(state.term_w * 0.75), state.sidebar_w + 20)
-        state.catalog_row0 = 5   # rows: header(3) + panel border(1) + table header(1)
+            if not needs_redraw:
+                time.sleep(0.016)
+                continue
 
-        # ── Cover art fetch ─────────────────────────────────────────────────
-        focus_full = state.playing_idx
-        if focus_full is None and state.catalog:
-            vis = visible_tracks(state)
-            if vis and state.selected_idx < len(vis):
-                try:
-                    focus_full = state.catalog.index(vis[state.selected_idx])
-                except ValueError:
-                    pass
+            cover_fetch_args = None
+            with state._lock:
+                state.needs_redraw = False
 
-        if (
-            focus_full is not None
-            and state.cover_track != focus_full
-            and (cover_spinner is None or not cover_spinner.is_alive())
-        ):
-            t = state.catalog[focus_full]
-            if t.cover_key and t.cover_key != "NONE":
+                sz           = shutil.get_terminal_size((120, 36))
+                state.term_w = sz.columns
+                state.term_h = sz.lines
+
+                state.sidebar_w   = max(int(state.term_w * 0.20), 20)
+                state.inspector_x = max(int(state.term_w * 0.75), state.sidebar_w + 20)
+
+                header_size = 3
+                body_top = header_size + 1
+                sidebar_content_row0 = body_top + 1
+                state.sidebar_nav_rows = {
+                    TAB_CATALOG: sidebar_content_row0,
+                    TAB_LIBRARY: sidebar_content_row0 + 2,
+                    TAB_SETTINGS: sidebar_content_row0 + 4,
+                }
+
+                # Center panel: top border + table top border + header row + separator
+                state.catalog_row0 = body_top + 4
+
+                _normalize_indexes_locked(state)
+                _visible_entries_locked(state)
+
+                # Fetch cover art only for the actively playing track
+                focus_full = state.playing_idx
+                if focus_full is not None and not (0 <= focus_full < len(state.catalog)):
+                    focus_full = None
+
+                if (
+                    focus_full is not None
+                    and state.cover_track != focus_full
+                    and (cover_spinner is None or not cover_spinner.is_alive())
+                ):
+                    t = state.catalog[focus_full]
+                    if t.cover_key and t.cover_key != "NONE":
+                        cover_fetch_args = (focus_full, t.tenant, t.cover_key)
+                    else:
+                        state.cover_bytes = None
+                        state.cover_track = focus_full
+
+                layout = Layout()
+                layout.split_column(
+                    Layout(name="header",  size=3),
+                    Layout(name="body",    ratio=1),
+                    Layout(name="footer",  size=4),
+                )
+                layout["body"].split_row(
+                    Layout(name="sidebar",   ratio=20),
+                    Layout(name="center",    ratio=55),
+                    Layout(name="inspector", ratio=25),
+                )
+                layout["inspector"].split_column(
+                    Layout(name="art",  ratio=60),
+                    Layout(name="meta", ratio=40),
+                )
+
+                layout["header"].update(build_header(state))
+                layout["sidebar"].update(build_sidebar(state))
+
+                if state.active_tab == TAB_SETTINGS:
+                    state.catalog_win_start = 0
+                    state.catalog_win_rows = 0
+                    layout["center"].update(build_settings(state))
+                else:
+                    layout["center"].update(build_catalog(state, state.term_h))
+
+                art_panel, meta_panel = build_inspector(state)
+                layout["art"].update(art_panel)
+                layout["meta"].update(meta_panel)
+                layout["footer"].update(build_footer(state))
+
+                cover_bytes = state.cover_bytes
+                cover_track = state.cover_track
+                term_w = state.term_w
+                term_h = state.term_h
+                inspector_x = state.inspector_x
+                playing_idx = state.playing_idx
+
+            if cover_fetch_args is not None:
                 cover_spinner = threading.Thread(
                     target=_cover_thread,
-                    args=(state, focus_full, t.tenant, t.cover_key),
+                    args=(state, *cover_fetch_args),
                     daemon=True,
                 )
                 cover_spinner.start()
-            else:
-                state.cover_bytes = None
-                state.cover_track = focus_full
 
-        # ── Build layout ────────────────────────────────────────────────────
-        layout = Layout()
-        layout.split_column(
-            Layout(name="header",  size=3),
-            Layout(name="body",    ratio=1),
-            Layout(name="footer",  size=4),
-        )
-        layout["body"].split_row(
-            Layout(name="sidebar",   ratio=20),
-            Layout(name="center",    ratio=55),
-            Layout(name="inspector", ratio=25),
-        )
-        layout["inspector"].split_column(
-            Layout(name="art",  ratio=60),
-            Layout(name="meta", ratio=40),
-        )
+            sys.stdout.write("\033[H")
+            console.print(layout)
+            # Clear old lines below the new render when terminal shrinks.
+            sys.stdout.write("\033[J")
 
-        layout["header"].update(build_header(state))
-        layout["sidebar"].update(build_sidebar(state))
-
-        if state.active_tab == TAB_SETTINGS:
-            layout["center"].update(build_settings(state))
-        else:
-            layout["center"].update(build_catalog(state, state.term_h))
-
-        art_panel, meta_panel = build_inspector(state)
-        layout["art"].update(art_panel)
-        layout["meta"].update(meta_panel)
-        layout["footer"].update(build_footer(state))
-
-        # ── ANTI-FLICKER RENDER: cursor to (0,0) then overwrite ─────────────
-        # Do NOT call console.clear() — repositioning avoids flicker and
-        # lets native terminal transparency bleed through.
-        sys.stdout.write("\033[H")
-        console.print(layout)
-
-        # ── POST-RENDER KITTY INJECTION ─────────────────────────────────────
-        if state.cover_bytes and state.cover_track == focus_full:
-            insp_w   = max(state.term_w - state.inspector_x - 1, 4)
-            art_rows = max(int((state.term_h - 7) * 0.60) - 1, 2)
-            inject_kitty(
-                state.cover_bytes,
-                col  = state.inspector_x + 2,   # 1-based, inside panel border
-                row  = 5,                        # below header(3) + border(1) + 1-based
-                cols = insp_w,
-                rows = art_rows,
-            )
-
-    # ── Cleanup ──────────────────────────────────────────────────────────────
-    disable_mouse()
-    show_cursor()
-    kill_mpv(state)
-    clear_kitty()
-    sys.stdout.write("\033[H\033[J")
-    sys.stdout.flush()
+            if cover_bytes and cover_track == playing_idx and playing_idx is not None:
+                insp_w   = max(term_w - inspector_x - 1, 4)
+                art_rows = max(int((term_h - 7) * 0.60) - 1, 2)
+                inject_kitty(
+                    cover_bytes,
+                    col=inspector_x + 2,
+                    row=5,
+                    cols=insp_w,
+                    rows=art_rows,
+                )
+    finally:
+        if mouse_enabled:
+            disable_mouse()
+        show_cursor()
+        kill_mpv(state)
+        clear_kitty()
+        if saved_attrs is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved_attrs)
+            except Exception:
+                pass
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
 
 
 def hide_cursor():
