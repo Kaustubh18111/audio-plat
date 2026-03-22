@@ -44,6 +44,7 @@ from rich import box
 from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.style import Style
 from rich.table import Table
@@ -137,10 +138,12 @@ class AppState:
     # Cover art
     cover_bytes: Optional[bytes] = None
     cover_track: Optional[int]   = None   # full-catalog idx whose art is loaded
+    last_drawn_cover: Optional[int] = None
 
     # Render geometry (updated each frame, read by mouse handler)
     term_w:       int = 120
     term_h:       int = 36
+    last_term_w:  int = 0
     catalog_row0: int = 5     # terminal row where catalog rows start (1-based)
     sidebar_w:    int = 24    # columns wide (approx 20% of term_w)
     inspector_x:  int = 91    # column where inspector starts (approx 75%)
@@ -329,7 +332,7 @@ def kill_mpv(state: AppState):
             pass
     try:
         os.remove(MPV_SOCK)
-    except FileNotFoundError:
+    except OSError:
         pass
     with state._lock:
         state.is_playing = False
@@ -339,17 +342,22 @@ def kill_mpv(state: AppState):
 
 def spawn_mpv(state: AppState, url: str):
     kill_mpv(state)
-    proc = subprocess.Popen(
-        ["mpv", "--no-video", "--msg-level=all=no",
-         f"--input-ipc-server={MPV_SOCK}", url],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    with state._lock:
-        state.mpv_proc   = proc
-        state.is_playing = True
-        state.elapsed    = 0.0
-        state.duration   = 0.0
+    try:
+        proc = subprocess.Popen(
+            ["mpv", "--no-video", "--msg-level=all=no",
+             f"--input-ipc-server={MPV_SOCK}", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with state._lock:
+            state.mpv_proc   = proc
+            state.is_playing = True
+            state.elapsed    = 0.0
+            state.duration   = 0.0
+    except OSError as e:
+        with state._lock:
+            push_log(state, f"[ERR] MPV ERROR: {e}")
+            state.needs_redraw = True
 
 
 def play_track(state: AppState, full_catalog_idx: int):
@@ -417,26 +425,37 @@ def _progress_thread(state: AppState):
 def _cover_thread(state: AppState, full_idx: int, tenant: str, cover_key: str):
     url = presign(tenant, cover_key)
     if not url:
+        with state._lock:
+            state.cover_bytes = None
+            state.cover_track = full_idx
+            state.needs_redraw = True
         return
     try:
         resp = requests.get(url, timeout=8)
         if resp.ok:
+            image_bytes: Optional[bytes] = None
             if Image is not None:
                 try:
                     with Image.open(io.BytesIO(resp.content)) as img:
                         out = io.BytesIO()
-                        img.save(out, format="PNG")
+                        img.convert("RGBA").save(out, format="PNG")
                         image_bytes = out.getvalue()
                 except Exception:
-                    image_bytes = resp.content
-            else:
-                image_bytes = resp.content
+                    image_bytes = None
             with state._lock:
                 state.cover_bytes  = image_bytes
                 state.cover_track  = full_idx
                 state.needs_redraw = True
+        else:
+            with state._lock:
+                state.cover_bytes = None
+                state.cover_track = full_idx
+                state.needs_redraw = True
     except Exception:
-        pass
+        with state._lock:
+            state.cover_bytes = None
+            state.cover_track = full_idx
+            state.needs_redraw = True
 
 
 # ─── MOUSE TRACKING ──────────────────────────────────────────────────────────
@@ -747,27 +766,28 @@ def _input_thread(state: AppState):
 
 # ─── KITTY INJECTION ─────────────────────────────────────────────────────────
 
-def inject_kitty(image_bytes: bytes, col: int, row: int, cols: int, rows: int):
-    """
-    Inject Kitty graphics directly to raw stdout AFTER rich has rendered.
-    col/row are 1-based terminal coordinates.
-    """
-    b64      = base64.standard_b64encode(image_bytes).decode()
+def inject_kitty_full(image_bytes: bytes, col: int, row: int, cols: int, rows: int, img_id: int):
+    """Uploads the image to terminal GPU and displays it."""
+    b64 = base64.standard_b64encode(image_bytes).decode()
     chunk_sz = 4096
-    chunks   = [b64[i: i + chunk_sz] for i in range(0, len(b64), chunk_sz)]
-    total    = len(chunks)
-    out      = sys.stdout
-
+    chunks = [b64[i: i + chunk_sz] for i in range(0, len(b64), chunk_sz)]
+    out = sys.stdout
     out.write(f"\033[{row};{col}H")
     for i, chunk in enumerate(chunks):
-        more = 1 if i + 1 < total else 0
+        more = 1 if i + 1 < len(chunks) else 0
         if i == 0:
-            out.write(
-                f"\033_Ga=T,f=100,c={cols},r={rows},s=auto,v=auto,q=2,m={more};{chunk}\033\\"
-            )
+            # FIXED: Removed s=auto,v=auto. Added z=-1 and q=2.
+            out.write(f"\033_Ga=T,i={img_id},f=100,c={cols},r={rows},z=-1,q=2,m={more};{chunk}\033\\")
         else:
             out.write(f"\033_Gm={more};{chunk}\033\\")
     out.flush()
+
+
+def inject_kitty_put(col: int, row: int, cols: int, rows: int, img_id: int):
+    """Restamps a previously uploaded image from terminal GPU."""
+    # FIXED: Added z=-1 and q=2
+    sys.stdout.write(f"\033[{row};{col}H\033_Ga=p,i={img_id},c={cols},r={rows},z=-1,q=2\033\\")
+    sys.stdout.flush()
 
 
 def clear_kitty():
@@ -1080,120 +1100,127 @@ def run_dashboard(console: Console, state: AppState):
 
         cover_spinner: Optional[threading.Thread] = None
 
-        while True:
-            with state._lock:
-                if state.quit:
-                    break
-                needs_redraw = state.needs_redraw
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header",  size=3),
+            Layout(name="body",    ratio=1),
+            Layout(name="footer",  size=4),
+        )
+        layout["body"].split_row(
+            Layout(name="sidebar",   ratio=20),
+            Layout(name="center",    ratio=55),
+            Layout(name="inspector", ratio=25),
+        )
+        layout["inspector"].split_column(
+            Layout(name="art",  ratio=60),
+            Layout(name="meta", ratio=40),
+        )
 
-            if not needs_redraw:
-                time.sleep(0.016)
-                continue
+        with Live(layout, console=console, screen=True, auto_refresh=False) as live:
+            while True:
+                with state._lock:
+                    if state.quit:
+                        break
+                    needs_redraw = state.needs_redraw
 
-            cover_fetch_args = None
-            with state._lock:
-                state.needs_redraw = False
+                if not needs_redraw:
+                    time.sleep(0.016)
+                    continue
 
-                sz           = shutil.get_terminal_size((120, 36))
-                state.term_w = sz.columns
-                state.term_h = sz.lines
+                cover_fetch_args = None
+                with state._lock:
+                    state.needs_redraw = False
 
-                state.sidebar_w   = max(int(state.term_w * 0.20), 20)
-                state.inspector_x = max(int(state.term_w * 0.75), state.sidebar_w + 20)
+                    sz = shutil.get_terminal_size((120, 36))
+                    state.term_w = sz.columns
+                    state.term_h = sz.lines
 
-                header_size = 3
-                body_top = header_size + 1
-                sidebar_content_row0 = body_top + 1
-                state.sidebar_nav_rows = {
-                    TAB_CATALOG: sidebar_content_row0,
-                    TAB_LIBRARY: sidebar_content_row0 + 2,
-                    TAB_SETTINGS: sidebar_content_row0 + 4,
-                }
+                    state.sidebar_w   = max(int(state.term_w * 0.20), 20)
+                    state.inspector_x = max(int(state.term_w * 0.75), state.sidebar_w + 20)
 
-                # Center panel: top border + table top border + header row + separator
-                state.catalog_row0 = body_top + 4
+                    header_size = 3
+                    body_top = header_size + 1
+                    sidebar_content_row0 = body_top + 1
+                    state.sidebar_nav_rows = {
+                        TAB_CATALOG: sidebar_content_row0,
+                        TAB_LIBRARY: sidebar_content_row0 + 2,
+                        TAB_SETTINGS: sidebar_content_row0 + 4,
+                    }
 
-                _normalize_indexes_locked(state)
-                _visible_entries_locked(state)
+                    state.catalog_row0 = body_top + 4
 
-                # Fetch cover art only for the actively playing track
-                focus_full = state.playing_idx
-                if focus_full is not None and not (0 <= focus_full < len(state.catalog)):
-                    focus_full = None
+                    _normalize_indexes_locked(state)
+                    _visible_entries_locked(state)
 
-                if (
-                    focus_full is not None
-                    and state.cover_track != focus_full
-                    and (cover_spinner is None or not cover_spinner.is_alive())
-                ):
-                    t = state.catalog[focus_full]
-                    if t.cover_key and t.cover_key != "NONE":
-                        cover_fetch_args = (focus_full, t.tenant, t.cover_key)
+                    # FIXED: Fetch art for navigated track, not just playing track
+                    focus_full = state.playing_idx
+                    if focus_full is None and state.catalog:
+                        entries = _visible_entries_locked(state)
+                        if entries and state.selected_idx < len(entries):
+                            focus_full = entries[state.selected_idx][0]
+
+                    if focus_full is not None and not (0 <= focus_full < len(state.catalog)):
+                        focus_full = None
+
+                    if (
+                        focus_full is not None
+                        and state.cover_track != focus_full
+                        and (cover_spinner is None or not cover_spinner.is_alive())
+                    ):
+                        t = state.catalog[focus_full]
+                        if t.cover_key and t.cover_key != "NONE":
+                            cover_fetch_args = (focus_full, t.tenant, t.cover_key)
+                        else:
+                            state.cover_bytes = None
+                            state.cover_track = focus_full
+
+                    layout["header"].update(build_header(state))
+                    layout["sidebar"].update(build_sidebar(state))
+
+                    if state.active_tab == TAB_SETTINGS:
+                        state.catalog_win_start = 0
+                        state.catalog_win_rows = 0
+                        layout["center"].update(build_settings(state))
                     else:
-                        state.cover_bytes = None
-                        state.cover_track = focus_full
+                        layout["center"].update(build_catalog(state, state.term_h))
 
-                layout = Layout()
-                layout.split_column(
-                    Layout(name="header",  size=3),
-                    Layout(name="body",    ratio=1),
-                    Layout(name="footer",  size=4),
-                )
-                layout["body"].split_row(
-                    Layout(name="sidebar",   ratio=20),
-                    Layout(name="center",    ratio=55),
-                    Layout(name="inspector", ratio=25),
-                )
-                layout["inspector"].split_column(
-                    Layout(name="art",  ratio=60),
-                    Layout(name="meta", ratio=40),
-                )
+                    art_panel, meta_panel = build_inspector(state)
+                    layout["art"].update(art_panel)
+                    layout["meta"].update(meta_panel)
+                    layout["footer"].update(build_footer(state))
 
-                layout["header"].update(build_header(state))
-                layout["sidebar"].update(build_sidebar(state))
+                    cover_bytes = state.cover_bytes
+                    cover_track = state.cover_track
+                    term_w = state.term_w
+                    term_h = state.term_h
+                    inspector_x = state.inspector_x
+                    extracted_focus = focus_full  # FIXED: Export the focus variable
 
-                if state.active_tab == TAB_SETTINGS:
-                    state.catalog_win_start = 0
-                    state.catalog_win_rows = 0
-                    layout["center"].update(build_settings(state))
-                else:
-                    layout["center"].update(build_catalog(state, state.term_h))
+                if cover_fetch_args is not None:
+                    cover_spinner = threading.Thread(
+                        target=_cover_thread,
+                        args=(state, *cover_fetch_args),
+                        daemon=True,
+                    )
+                    cover_spinner.start()
 
-                art_panel, meta_panel = build_inspector(state)
-                layout["art"].update(art_panel)
-                layout["meta"].update(meta_panel)
-                layout["footer"].update(build_footer(state))
+                live.update(layout, refresh=True)
 
-                cover_bytes = state.cover_bytes
-                cover_track = state.cover_track
-                term_w = state.term_w
-                term_h = state.term_h
-                inspector_x = state.inspector_x
-                playing_idx = state.playing_idx
+                # FIXED: Uses extracted_focus instead of playing_idx
+                if cover_bytes and cover_track == extracted_focus and extracted_focus is not None:
+                    insp_w   = max(term_w - inspector_x - 1, 4)
+                    art_rows = max(int((term_h - 7) * 0.60) - 1, 2)
+                    img_id   = extracted_focus + 1000
 
-            if cover_fetch_args is not None:
-                cover_spinner = threading.Thread(
-                    target=_cover_thread,
-                    args=(state, *cover_fetch_args),
-                    daemon=True,
-                )
-                cover_spinner.start()
+                    if getattr(state, "last_term_w", 0) != term_w:
+                        state.last_drawn_cover = None
+                        state.last_term_w = term_w
 
-            sys.stdout.write("\033[H")
-            console.print(layout)
-            # Clear old lines below the new render when terminal shrinks.
-            sys.stdout.write("\033[J")
-
-            if cover_bytes and cover_track == playing_idx and playing_idx is not None:
-                insp_w   = max(term_w - inspector_x - 1, 4)
-                art_rows = max(int((term_h - 7) * 0.60) - 1, 2)
-                inject_kitty(
-                    cover_bytes,
-                    col=inspector_x + 2,
-                    row=5,
-                    cols=insp_w,
-                    rows=art_rows,
-                )
+                    if getattr(state, "last_drawn_cover", None) != extracted_focus:
+                        inject_kitty_full(cover_bytes, inspector_x + 2, 5, insp_w, art_rows, img_id)
+                        state.last_drawn_cover = extracted_focus
+                    else:
+                        inject_kitty_put(inspector_x + 2, 5, insp_w, art_rows, img_id)
     finally:
         if mouse_enabled:
             disable_mouse()
